@@ -20,7 +20,13 @@ input the planner uses; VQA side is toggled with `vqa_use_trajectory_input`).
 Inference only runs when **new camera data has arrived** since the last run
 (`require_new_data`, default `true`), so replaying a bag and letting it end no
 longer produces trajectories/answers on a frozen buffer. A question change still
-forces one fresh answer.
+forces one fresh answer, and while a question is unanswered the VQA path
+**preempts** the trajectory tick (both share the one GPU worker), so a new
+question is always picked up within one `vqa_period_sec`.
+
+The question the node is actually using is echoed (latched) on
+`<question_topic>/active` — `ros2 topic echo /tele_alpa/question/active` confirms
+a runtime `/tele_alpa/question` was received.
 
 ```bash
 ros2 launch tele_alpa tele_alpa.launch.py question:="Is it safe to merge left?"
@@ -136,7 +142,8 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 | `question_topic` | `/tele_alpa/question` | Runtime question input (`std_msgs/String`) |
 | `answer_topic` / `answer_stamped_topic` | `/tele_alpa/answer` / `_stamped` | Answer outputs (`String` / `StringStamped`) |
 | `answer_once` | `false` | Answer once per question change instead of every `vqa_period_sec` |
-| `vqa_use_trajectory_input` | `true` | Fuse ego trajectory-history tokens into the VQA prompt (same input the planner uses) |
+| `vqa_use_trajectory_input` | `true` | Fuse ego trajectory-history tokens into the VQA prompt (same input the planner uses); biases answers toward driving actions — set `false` for description-style answers |
+| `vqa_system_prompt` | `"You are a driving assistant. …answer the question about the scene directly…"` | System prompt for the VQA path; empty string keeps the upstream *"generates safe and accurate actions"* prompt |
 | `vqa_max_generation_length` | `384` | Token budget for the answer (too small → empty answer) |
 | `vqa_num_samples` | `1` | Answer samples per VQA run |
 
@@ -187,6 +194,28 @@ fused `<|traj_history|>` ego-motion tokens.
 - **Empty VQA answer** — the model did not emit `<|answer_end|>` within the token
   budget. The node now publishes an explicit `[no answer: ...]` string instead of
   an empty one; raise `vqa_max_generation_length` (default 384).
+- **Answer comes back as `[source=cot]` / `[source=meta_action]` or reads like a
+  driving instruction** (`Q: Is it safe to change left?` → `A: Nudge left to
+  clear the stopped van`) — with `vqa_use_trajectory_input:=true` (default) the
+  fused `<|traj_history|>` tokens + the *"...generates safe and accurate
+  actions"* system prompt put the model into a **trajectory-aware rollout**: it
+  answers in short driving-action form and closes `<|cot_end|>` rather than
+  `<|answer_end|>`. The reply is usually still on-topic; it's just planning-style.
+  For plain descriptive Q&A run:
+
+  ```bash
+  ros2 launch tele_alpa tele_alpa.launch.py \
+    question:="Describe the scene." vqa_use_trajectory_input:=false
+  ```
+
+  which gives the model a clean `<|answer_start|>..<|answer_end|>` VQA prompt.
+  The node also overrides the system prompt (`vqa_system_prompt`, blank = keep
+  upstream). Confirm the question is actually steering the output by publishing
+  two different questions and diffing the answers, and check
+  `ros2 topic echo /tele_alpa/question/active` shows the one you sent.
+- Note: Alpamayo 1.5 is a **driving** VLA, not a general VQA model — even in pure
+  VQA mode its answers stay terse and driving-centric. That is a model capability
+  limit, not a node bug.
 - **CUDA OOM** — use a GPU with 24 GB+ VRAM, or increase `inference_period_sec`.
 - **Flash Attention issues** — set `config.attn_implementation = "sdpa"` as a fallback.
 

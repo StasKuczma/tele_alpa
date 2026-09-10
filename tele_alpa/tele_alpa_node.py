@@ -2,30 +2,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
 
-"""One ROS 2 node, one Alpamayo 1.5 model, two outputs:
+"""One ROS 2 node, one Alpamayo 1.5 model, everything ``alpamayo_ros`` does
+plus scene question answering.
 
-* an Autoware trajectory (+ chain-of-thought "reasoning" / RViz markers / nav
-  text), and
-* answers to free-form questions about the live scene (VQA).
+Outputs
+-------
+* an Autoware ``Trajectory`` (+ RViz markers),
+* the planner's chain-of-thought "reasoning" and derived navigation text,
+* a free-form answer to a question about the live scene (VQA).
 
-The 10B model is loaded **once**. The trajectory path and the VQA path share a
-single-worker executor, so they never run on the GPU at the same time, and they
-consume the same buffered input — a 4-camera x 4-frame image stack plus the ego
-trajectory history.
+The 10B model is loaded **once**. The trajectory path and the VQA path submit to
+the same single-worker executor, so they never touch the GPU at the same time,
+and both consume the same buffered input: a multi-camera x N-frame image stack
+plus the ego trajectory history.
 
 Reasoning vs. VQA
 -----------------
 Both are text from the same model over the same images, but they come from
 different prompts and different decode routines:
 
-* **Reasoning (chain-of-thought)** is a by-product of *planning*. The planning
-  prompt (``helper.create_message``) seeds ``<|cot_start|>`` and asks the model
-  to "output the chain-of-thought reasoning of the driving process, then output
-  the future trajectory". ``sample_trajectories_*`` runs that rollout, decodes
-  the ``<i..>`` trajectory tokens into a path, and returns the free-text spans
-  as ``extra["cot"]`` / ``extra["meta_action"]``. It explains *why this
-  trajectory* — it does not answer a question. Published on ``cot_topic``.
-* **VQA** is standalone Q&A. ``helper.create_vqa_message`` wraps your question in
+* **Reasoning (chain-of-thought)** is a by-product of *planning*.
+  ``helper.create_message`` seeds ``<|cot_start|>`` and asks the model to
+  "output the chain-of-thought reasoning of the driving process, then output the
+  future trajectory". ``sample_trajectories_*`` runs that rollout, decodes the
+  ``<i..>`` trajectory tokens into a path, and returns the free text as
+  ``extra["cot"]`` / ``extra["meta_action"]``. It explains *why this trajectory*;
+  it does not answer a question. Published on ``cot_topic``.
+* **VQA** is standalone Q&A. ``helper.create_vqa_message`` wraps the question in
   ``<|question_start|>..<|question_end|>`` and seeds ``<|answer_start|>``;
   ``model.generate_text`` does plain autoregressive decoding (no diffusion, no
   trajectory tokens) and returns ``extra["answer"]``. Text only, no trajectory.
@@ -39,7 +42,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -59,7 +62,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
-try:
+try:  # navigation text is optional — needs the lanelet2 python bindings
     import lanelet2
     from autoware_lanelet2_extension_python.projection import MGRSProjector
 
@@ -68,11 +71,15 @@ except ImportError:
     _HAS_LANELET2 = False
 
 DEFAULT_QUESTION = "What should the ego vehicle do next, and why?"
+DEFAULT_VQA_SYSTEM_PROMPT = (
+    "You are a driving assistant. Look at the camera images and answer the "
+    "question about the scene directly, concisely, and factually."
+)
 
 # Ego trajectory-history placeholder, identical to the one
 # ``helper.create_message`` builds for planning. ``fuse_traj_tokens`` swaps these
-# pad tokens for the encoded ego motion so the VLM gets the same trajectory
-# input during VQA that it gets during planning.
+# pad tokens for the encoded ego motion so the VLM gets the same trajectory input
+# during VQA that it gets during planning.
 _NUM_TRAJ_HISTORY_TOKENS = 48
 _HIST_TRAJ_PLACEHOLDER = (
     "<|traj_history_start|>"
@@ -80,159 +87,127 @@ _HIST_TRAJ_PLACEHOLDER = (
     + "<|traj_history_end|>"
 )
 
+_MODEL_INPUT_SIZE = (560, 1008)  # (H, W) the VLM image tower expects
+
 
 class TeleAlpaNode(Node):
-    """Runs Alpamayo 1.5 once and publishes both a trajectory and scene answers."""
+    """Alpamayo 1.5: Autoware trajectory planning + chain-of-thought + scene VQA."""
 
     def __init__(self) -> None:
         super().__init__("tele_alpa_node")
 
-        self.model_name: str = "nvidia/Alpamayo-1.5-10B"
-
-        # --- trajectory params ---
-        self.declare_parameter("trajectory_topic", "/alpamayo/predicted_trajectory")
-        self.declare_parameter("cot_topic", "/alpamayo/reasoning")
-        self.declare_parameter("cot_with_stamped_topic", "/alpamayo/reasoning_stamped")
-        self.declare_parameter("nav_text_topic", "/alpamayo/nav_text")
-        self.declare_parameter("odometry_topic", "/localization/kinematic_state")
-        self.declare_parameter("route_topic", "/planning/mission_planning/route")
-        self.declare_parameter("inference_period_sec", 1.0)
-        # ROS2 Jazzy: non-empty defaults so string/int array param types infer.
-        self.declare_parameter("camera_topics", [""])
-        # 0=Front left, 1=Front, 2=Front right, 3=Rear left, 4=Rear,
-        # 5=Rear right, 6=Front telephoto — one index per camera topic.
-        self.declare_parameter("camera_indices", [0])
-        self.declare_parameter("lanelet2_map_path", "")
-        self.declare_parameter("num_diffusion_steps", 5)
-        self.declare_parameter("use_greedy_decode", True)
-        self.declare_parameter("top_p", 0.98)
-        self.declare_parameter("temperature", 0.6)
-        self.declare_parameter("max_generation_length", 64)
-        self.declare_parameter("expert_onnx_path", "")
-
-        # --- shared ---
-        # Only run inference when a new camera frame has arrived since the last
-        # run. Stops the node inferring on a frozen buffer after a bag ends.
-        self.declare_parameter("require_new_data", True)
-
-        # --- VQA params ---
-        self.declare_parameter("vqa_enabled", True)
-        self.declare_parameter("question", DEFAULT_QUESTION)
-        self.declare_parameter("question_topic", "/tele_alpa/question")
-        self.declare_parameter("answer_topic", "/tele_alpa/answer")
-        self.declare_parameter("answer_stamped_topic", "/tele_alpa/answer_stamped")
-        self.declare_parameter("vqa_period_sec", 2.0)
-        # Answer once per question change, then idle (vs. re-answer every tick).
-        self.declare_parameter("answer_once", False)
-        # Token budget for the answer. If the model does not emit `<|answer_end|>`
-        # within this many tokens the parsed answer is empty, so keep it roomy.
-        self.declare_parameter("vqa_max_generation_length", 384)
-        self.declare_parameter("vqa_num_samples", 1)
-        # Feed the ego trajectory history into the VQA prompt too.
-        self.declare_parameter("vqa_use_trajectory_input", True)
-
+        self.model_name = "nvidia/Alpamayo-1.5-10B"
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
-
-        KINEMATIC_STATE_HZ = 50.0
-        ALPAMAYO_INPUT_HZ = 10.0  # model expects 10 Hz (time_step = 0.1 s)
-        self.skip_num = int(KINEMATIC_STATE_HZ / ALPAMAYO_INPUT_HZ)
-        self._num_history_steps = 16
-        self._num_frames = 4
         self._frame_id = "base_link"
 
-        # --- publishers ---
+        # /localization/kinematic_state is ~50 Hz; the model expects 10 Hz input.
+        self._kinematic_hz = 50.0
+        self._model_input_hz = 10.0
+        self._odom_skip = int(self._kinematic_hz / self._model_input_hz)
+        self._num_history_steps = 16
+        self._num_frames = 4
+
+        self._declare_parameters()
+
+        # ------------------------------------------------------------------ #
+        # Publishers                                                        #
+        # ------------------------------------------------------------------ #
         qs = 10
-        traj_topic = self.get_parameter("trajectory_topic").value
-        self._trajectory_pub = self.create_publisher(Trajectory, traj_topic, qs)
-        self._cot_pub = self.create_publisher(String, self.get_parameter("cot_topic").value, qs)
-        self._cot_stamped_pub = self.create_publisher(
-            StringStamped, self.get_parameter("cot_with_stamped_topic").value, qs
-        )
-        self._nav_text_pub = self.create_publisher(
-            String, self.get_parameter("nav_text_topic").value, qs
-        )
+        traj_topic = self._param("trajectory_topic")
+        self._traj_pub = self.create_publisher(Trajectory, traj_topic, qs)
         self._marker_pub = self.create_publisher(MarkerArray, f"{traj_topic}_markers", qs)
-        self._answer_pub = self.create_publisher(
-            String, self.get_parameter("answer_topic").value, qs
+        self._reasoning_pub = self.create_publisher(String, self._param("cot_topic"), qs)
+        self._reasoning_stamped_pub = self.create_publisher(
+            StringStamped, self._param("cot_with_stamped_topic"), qs
         )
+        self._nav_text_pub = self.create_publisher(String, self._param("nav_text_topic"), qs)
+        self._answer_pub = self.create_publisher(String, self._param("answer_topic"), qs)
         self._answer_stamped_pub = self.create_publisher(
-            StringStamped, self.get_parameter("answer_stamped_topic").value, qs
+            StringStamped, self._param("answer_stamped_topic"), qs
         )
         # Latched echo of the question the node is actually using — lets
-        # `ros2 topic echo <question_topic>/active` confirm that a runtime
-        # question published on `question_topic` was received.
+        # `ros2 topic echo <question_topic>/active` confirm a runtime question
+        # published on `question_topic` was received.
         self._active_question_pub = self.create_publisher(
             String,
-            f"{self.get_parameter('question_topic').value}/active",
+            f"{self._param('question_topic')}/active",
             QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
                 depth=1,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             ),
         )
-        self.get_logger().info(
-            f"Publishing trajectory on {traj_topic}, answers on "
-            f"{self.get_parameter('answer_topic').value}"
-        )
 
-        # --- executor + gating state (shared by both paths) ---
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._active_future: Optional[Future] = None
-        self._require_new_data = bool(self.get_parameter("require_new_data").value)
-        self._rx_count = 0  # monotonic count of camera msgs; frozen when stream stops
+        # ------------------------------------------------------------------ #
+        # Runtime config                                                    #
+        # ------------------------------------------------------------------ #
+        self._require_new_data = bool(self._param("require_new_data"))
+        self._vqa_enabled = bool(self._param("vqa_enabled"))
+        self._answer_once = bool(self._param("answer_once"))
+        self._vqa_use_traj = bool(self._param("vqa_use_trajectory_input"))
+        self._vqa_system_prompt = str(self._param("vqa_system_prompt") or "").strip()
+        self._cot_max_gen_len = int(self._param("max_generation_length"))
+        self._vqa_max_gen_len = int(self._param("vqa_max_generation_length"))
+        self._vqa_num_samples = max(1, int(self._param("vqa_num_samples")))
+
+        self._question = str(self._param("question") or DEFAULT_QUESTION).strip() or DEFAULT_QUESTION
+        self._last_answered_question: Optional[str] = None
+
+        # Monotonic count of camera messages; frozen when the stream stops.
+        self._rx_count = 0
         self._last_traj_rx = -1
         self._last_vqa_rx = -1
+        self._nav_text: Optional[str] = None
+        self._warned_no_odom = False
 
-        # --- camera subscriptions ---
-        camera_topics = list(
-            self.get_parameter("camera_topics").get_parameter_value().string_array_value
-        )
-        if not camera_topics or camera_topics == [""]:
-            raise ValueError("camera_topics parameter must list at least one image topic.")
-        self._camera_topics = camera_topics
-
-        camera_indices = list(
-            self.get_parameter("camera_indices").get_parameter_value().integer_array_value
-        )
-        if len(camera_indices) != len(camera_topics):
+        # ------------------------------------------------------------------ #
+        # Subscriptions                                                     #
+        # ------------------------------------------------------------------ #
+        self._camera_topics: List[str] = [
+            t for t in self._param("camera_topics") if t
+        ]
+        if not self._camera_topics:
+            raise ValueError("camera_topics must list at least one image topic.")
+        camera_indices = list(self._param("camera_indices"))
+        if len(camera_indices) != len(self._camera_topics):
             raise ValueError(
                 f"camera_indices length ({len(camera_indices)}) must match "
-                f"camera_topics length ({len(camera_topics)})."
+                f"camera_topics length ({len(self._camera_topics)})."
             )
         self._camera_indices = torch.tensor(camera_indices, dtype=torch.int64)
         self._camera_buffers = {
             topic: deque(maxlen=self._num_frames * 3) for topic in self._camera_topics
         }
 
-        camera_qos = QoSProfile(
+        sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10
         )
         for topic in self._camera_topics:
             self.create_subscription(
-                CompressedImage,
-                topic,
-                lambda msg, t=topic: self._image_callback(t, msg),
-                camera_qos,
+                CompressedImage, topic, lambda m, t=topic: self._on_image(t, m), sensor_qos
             )
-            self.get_logger().info(f"Subscribed to camera topic: {topic}")
+            self.get_logger().info(f"camera <- {topic}")
 
-        # --- odometry (ego trajectory history) ---
-        self._odometry_buffer: deque = deque(
-            maxlen=self._num_history_steps * self.skip_num + 10
-        )
+        self._odom_buffer: deque = deque(maxlen=self._num_history_steps * self._odom_skip + 10)
         odom_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=50
         )
-        odom_topic = self.get_parameter("odometry_topic").value
-        self.create_subscription(Odometry, odom_topic, self._odometry_callback, odom_qos)
-        self.get_logger().info(f"Subscribed to odometry topic: {odom_topic}")
+        self.create_subscription(
+            Odometry, self._param("odometry_topic"), self._on_odometry, odom_qos
+        )
+        self.get_logger().info(f"odometry <- {self._param('odometry_topic')}")
 
-        # --- lanelet2 map + route (nav text) ---
-        self._lanelet_map = None
+        self.create_subscription(
+            String, self._param("question_topic"), self._on_question, qs
+        )
+
+        # ------------------------------------------------------------------ #
+        # Lanelet2 map + route  ->  navigation text                         #
+        # ------------------------------------------------------------------ #
+        self._lanelet_map: Optional[dict] = None
         self._route_lanelet_ids: List[int] = []
-        self._nav_text: Optional[str] = None
-        map_path = self.get_parameter("lanelet2_map_path").value
+        map_path = self._param("lanelet2_map_path")
         if map_path:
             self._load_lanelet2_map(map_path)
         route_qos = QoSProfile(
@@ -242,200 +217,181 @@ class TeleAlpaNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(
-            LaneletRoute, self.get_parameter("route_topic").value, self._route_callback, route_qos
+            LaneletRoute, self._param("route_topic"), self._on_route, route_qos
         )
 
-        # --- question input ---
-        self._question = (
-            str(self.get_parameter("question").value or DEFAULT_QUESTION).strip()
-            or DEFAULT_QUESTION
-        )
-        self._answer_once = bool(self.get_parameter("answer_once").value)
-        self._vqa_enabled = bool(self.get_parameter("vqa_enabled").value)
-        self._vqa_use_traj = bool(self.get_parameter("vqa_use_trajectory_input").value)
-        self._last_answered_question: Optional[str] = None
-        self._warned_no_odom = False
-        self.create_subscription(
-            String, self.get_parameter("question_topic").value, self._question_callback, qs
-        )
-        self._publish_active_question()
-
-        # --- model: loaded ONCE, shared by both paths ---
+        # ------------------------------------------------------------------ #
+        # Model — loaded ONCE, shared by both paths                         #
+        # ------------------------------------------------------------------ #
         self.get_logger().info(
-            f"Loading Alpamayo model {self.model_name} on device={self._device} dtype={self._dtype}"
+            f"Loading {self.model_name} on {self._device} ({self._dtype}) ..."
         )
         self._model = Alpamayo1_5.from_pretrained(self.model_name, dtype=self._dtype).to(
             self._device
         )
         self._model.eval()
-
-        expert_onnx = str(self.get_parameter("expert_onnx_path").value or "")
-        if expert_onnx and Path(expert_onnx).exists():
-            from alpamayo1_5.trt.expert_runtime import TrtExpertEngine
-
-            engine = TrtExpertEngine(
-                onnx_model_path=expert_onnx,
-                engine_cache_dir=str(Path(expert_onnx).parent / "engine_cache"),
-                enable_int8=False,
-                enable_fp16=True,
-            )
-            self._model.set_expert_step_runner(engine)
-            self.get_logger().info(f"TRT Expert loaded: {expert_onnx}")
-        else:
-            self.get_logger().info("TRT Expert: off (native PyTorch denoiser).")
-
-        num_steps = int(self.get_parameter("num_diffusion_steps").value)
+        self._configure_expert()
+        num_steps = int(self._param("num_diffusion_steps"))
         self._model.diffusion.num_inference_steps = num_steps
-        self.get_logger().info(f"Diffusion inference steps: {num_steps}")
+        self.get_logger().info(f"diffusion steps: {num_steps}")
 
-        self._use_greedy = bool(self.get_parameter("use_greedy_decode").value)
-        if self._use_greedy:
+        if bool(self._param("use_greedy_decode")):
             self._top_p, self._temperature = 1.0, 1.0
-            self.get_logger().info("Generation: GREEDY (top_p=1.0, temperature=1.0)")
+            self.get_logger().info("decode: GREEDY (top_p=1.0, temperature=1.0)")
         else:
-            self._top_p = float(self.get_parameter("top_p").value)
-            self._temperature = float(self.get_parameter("temperature").value)
+            self._top_p = float(self._param("top_p"))
+            self._temperature = float(self._param("temperature"))
             self.get_logger().info(
-                f"Generation: NUCLEUS (top_p={self._top_p}, temperature={self._temperature})"
+                f"decode: NUCLEUS (top_p={self._top_p}, temperature={self._temperature})"
             )
-        self._max_gen_len = int(self.get_parameter("max_generation_length").value)
-        self._vqa_max_gen_len = int(self.get_parameter("vqa_max_generation_length").value)
-        self._vqa_num_samples = max(1, int(self.get_parameter("vqa_num_samples").value))
 
         self._processor = helper.get_processor(self._model.tokenizer)
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
 
-        # --- timers ---
+        # ------------------------------------------------------------------ #
+        # Executor + timers                                                 #
+        # ------------------------------------------------------------------ #
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._active_future: Optional[Future] = None
+
         self._traj_timer = self.create_timer(
-            float(self.get_parameter("inference_period_sec").value), self._traj_timer_callback
+            float(self._param("inference_period_sec")), self._traj_timer_callback
         )
         if self._vqa_enabled:
             self._vqa_timer = self.create_timer(
-                float(self.get_parameter("vqa_period_sec").value), self._vqa_timer_callback
+                float(self._param("vqa_period_sec")), self._vqa_timer_callback
             )
-            self.get_logger().info(f"VQA enabled. Current question: {self._question!r}")
-        else:
-            self.get_logger().info("VQA disabled (vqa_enabled:=false).")
+        self._publish_active_question()
+        self.get_logger().info(
+            f"tele_alpa ready — trajectory on {traj_topic}, "
+            f"answers on {self._param('answer_topic')}, "
+            f"VQA {'enabled' if self._vqa_enabled else 'disabled'}, "
+            f"question={self._question!r}"
+        )
 
-        self.get_logger().info("tele_alpa node ready — one model, trajectory + VQA.")
+    # ------------------------------------------------------------------ #
+    # Parameters                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _declare_parameters(self) -> None:
+        # --- trajectory (mirrors alpamayo_ros) ---
+        self.declare_parameter("trajectory_topic", "/alpamayo/predicted_trajectory")
+        self.declare_parameter("cot_topic", "/alpamayo/reasoning")
+        self.declare_parameter("cot_with_stamped_topic", "/alpamayo/reasoning_stamped")
+        self.declare_parameter("nav_text_topic", "/alpamayo/nav_text")
+        self.declare_parameter("odometry_topic", "/localization/kinematic_state")
+        self.declare_parameter("route_topic", "/planning/mission_planning/route")
+        self.declare_parameter("lanelet2_map_path", "")
+        self.declare_parameter("inference_period_sec", 1.0)
+        # ROS 2 needs a non-empty default for array params to infer the type.
+        self.declare_parameter("camera_topics", [""])
+        # 0=Front left 1=Front 2=Front right 3=Rear left 4=Rear 5=Rear right
+        # 6=Front telephoto — one index per camera topic.
+        self.declare_parameter("camera_indices", [0])
+        self.declare_parameter("num_diffusion_steps", 5)
+        self.declare_parameter("use_greedy_decode", True)
+        self.declare_parameter("top_p", 0.98)
+        self.declare_parameter("temperature", 0.6)
+        self.declare_parameter("max_generation_length", 64)
+        self.declare_parameter("expert_onnx_path", "")
+        # Only infer when a new camera frame has arrived since the last run —
+        # stops output on a frozen buffer after a bag ends.
+        self.declare_parameter("require_new_data", True)
+
+        # --- VQA ---
+        self.declare_parameter("vqa_enabled", True)
+        self.declare_parameter("question", DEFAULT_QUESTION)
+        self.declare_parameter("question_topic", "/tele_alpa/question")
+        self.declare_parameter("answer_topic", "/tele_alpa/answer")
+        self.declare_parameter("answer_stamped_topic", "/tele_alpa/answer_stamped")
+        self.declare_parameter("vqa_period_sec", 2.0)
+        # Answer once per question change, then idle (vs. re-answer every tick).
+        self.declare_parameter("answer_once", False)
+        # Token budget for the answer. Too small -> the model never closes
+        # <|answer_end|> and the parsed answer is empty.
+        self.declare_parameter("vqa_max_generation_length", 500)
+        self.declare_parameter("vqa_num_samples", 1)
+        # Fuse the ego trajectory-history tokens into the VQA prompt. Leaving this
+        # on biases answers toward planning-style output; set false for
+        # description-style answers.
+        self.declare_parameter("vqa_use_trajectory_input", True)
+        # System prompt for the VQA path. helper.create_vqa_message bakes in
+        # "...generates safe and accurate actions", which pushes the model to
+        # reply with a driving action instead of addressing the question. An
+        # empty string keeps that upstream default.
+        self.declare_parameter("vqa_system_prompt", DEFAULT_VQA_SYSTEM_PROMPT)
+
+    def _param(self, name: str):
+        return self.get_parameter(name).value
+
+    def _configure_expert(self) -> None:
+        onnx = str(self._param("expert_onnx_path") or "")
+        if onnx and Path(onnx).exists():
+            from alpamayo1_5.trt.expert_runtime import TrtExpertEngine
+
+            engine = TrtExpertEngine(
+                onnx_model_path=onnx,
+                engine_cache_dir=str(Path(onnx).parent / "engine_cache"),
+                enable_int8=False,
+                enable_fp16=True,
+            )
+            self._model.set_expert_step_runner(engine)
+            self.get_logger().info(f"TRT expert engine: {onnx}")
+        else:
+            self.get_logger().info("TRT expert engine: off (native PyTorch denoiser).")
 
     # ------------------------------------------------------------------ #
     # Subscription callbacks                                            #
     # ------------------------------------------------------------------ #
 
-    def _image_callback(self, topic: str, msg: CompressedImage) -> None:
-        jpeg_bytes = torch.frombuffer(bytearray(msg.data), dtype=torch.uint8)
-        self._camera_buffers[topic].append((msg.header.stamp, jpeg_bytes))
+    def _on_image(self, topic: str, msg: CompressedImage) -> None:
+        jpeg = torch.frombuffer(bytearray(msg.data), dtype=torch.uint8)
+        self._camera_buffers[topic].append((msg.header.stamp, jpeg))
         self._rx_count += 1
 
-    def _odometry_callback(self, msg: Odometry) -> None:
-        self._odometry_buffer.append(msg)
+    def _on_odometry(self, msg: Odometry) -> None:
+        self._odom_buffer.append(msg)
 
-    def _question_callback(self, msg: String) -> None:
-        question = msg.data.strip()
-        if not question:
+    def _on_route(self, msg: LaneletRoute) -> None:
+        self._route_lanelet_ids = [seg.preferred_primitive.id for seg in msg.segments]
+        self.get_logger().info(f"route: {len(self._route_lanelet_ids)} segments")
+
+    def _on_question(self, msg: String) -> None:
+        q = msg.data.strip()
+        if not q:
             return
-        if question != self._question:
-            self.get_logger().info(f"New question: {question!r}")
-        self._question = question
+        if q != self._question:
+            self.get_logger().info(f"new question: {q!r}")
+        self._question = q
         self._last_answered_question = None  # force a fresh answer
         self._publish_active_question()
 
     def _publish_active_question(self) -> None:
-        m = String()
-        m.data = self._question
-        self._active_question_pub.publish(m)
-
-    def _route_callback(self, msg: LaneletRoute) -> None:
-        self._route_lanelet_ids = [seg.preferred_primitive.id for seg in msg.segments]
-        self.get_logger().info(f"Received route with {len(self._route_lanelet_ids)} segments.")
-
-    # ------------------------------------------------------------------ #
-    # Lanelet2 map + navigation text                                    #
-    # ------------------------------------------------------------------ #
-
-    def _load_lanelet2_map(self, map_path: str) -> None:
-        if not _HAS_LANELET2:
-            self.get_logger().warn(
-                "lanelet2 / autoware_lanelet2_extension_python not available. "
-                "Navigation instructions disabled."
-            )
-            return
-        self.get_logger().info(f"Loading lanelet2 map from {map_path}...")
-        projection = MGRSProjector(lanelet2.io.Origin(0.0, 0.0))
-        ll2_map = lanelet2.io.load(map_path, projection)
-
-        lanelet_info: dict[int, dict] = {}
-        for ll in ll2_map.laneletLayer:
-            subtype = ll.attributes.get("subtype", "") if hasattr(ll.attributes, "get") else ""
-            if not subtype:
-                subtype = ll.attributes["subtype"] if "subtype" in ll.attributes else ""
-            if subtype not in ("road", "highway", "road_shoulder", "bicycle_lane"):
-                continue
-            centerline = np.array([(p.x, p.y, p.z) for p in ll.centerline])
-            turn_dir_str = ll.attributes["turn_direction"] if "turn_direction" in ll.attributes else ""
-            lanelet_info[ll.id] = {
-                "centerline": centerline,
-                "turn_direction": turn_dir_str,
-                "center": np.mean(centerline[:, :2], axis=0),
-            }
-        self._lanelet_map = lanelet_info
-        self.get_logger().info(f"Loaded {len(lanelet_info)} road lanelets from map.")
-
-    def _compute_nav_text(self, ego_pos_map: np.ndarray) -> Optional[str]:
-        if self._lanelet_map is None or not self._route_lanelet_ids:
-            return None
-        ego_xy = ego_pos_map[:2]
-
-        best_idx, best_dist = 0, float("inf")
-        for i, ll_id in enumerate(self._route_lanelet_ids):
-            info = self._lanelet_map.get(ll_id)
-            if info is None:
-                continue
-            dist = np.linalg.norm(info["centerline"][0, :2] - ego_xy)
-            if dist < best_dist:
-                best_dist, best_idx = dist, i
-
-        current_info = self._lanelet_map.get(self._route_lanelet_ids[best_idx])
-        if current_info is not None and current_info["turn_direction"] in ("left", "right"):
-            return f"Turn {current_info['turn_direction']}"
-
-        cumulative_dist = 0.0
-        prev_pt = ego_xy
-        for i in range(best_idx + 1, len(self._route_lanelet_ids)):
-            info = self._lanelet_map.get(self._route_lanelet_ids[i])
-            if info is None:
-                continue
-            first_pt = info["centerline"][0, :2]
-            cumulative_dist += np.linalg.norm(first_pt - prev_pt)
-            prev_pt = first_pt
-            if info["turn_direction"] in ("left", "right"):
-                return f"Turn {info['turn_direction']} in {int(round(cumulative_dist))}m"
-        return "Continue straight"
+        self._active_question_pub.publish(String(data=self._question))
 
     # ------------------------------------------------------------------ #
     # Shared input preparation                                          #
     # ------------------------------------------------------------------ #
 
-    def _prepare_image_frames(self) -> Optional[torch.Tensor]:
-        """GPU-decode the latest frames -> ``[n_cams, n_frames, 3, 560, 1008]`` uint8."""
-        if not all(len(buf) >= self._num_frames for buf in self._camera_buffers.values()):
+    def _decode_latest_frames(self) -> Optional[torch.Tensor]:
+        """GPU-decode the newest frames -> ``[n_cams, n_frames, 3, H, W]`` uint8."""
+        if not all(len(b) >= self._num_frames for b in self._camera_buffers.values()):
             return None
 
         import torchvision
 
-        jpeg_buffers: list[torch.Tensor] = []
+        jpegs: List[torch.Tensor] = []
         for topic in self._camera_topics:
-            frames = list(self._camera_buffers[topic])[-self._num_frames :]
-            jpeg_buffers.extend([f for _, f in frames])
+            jpegs.extend(f for _, f in list(self._camera_buffers[topic])[-self._num_frames :])
 
-        decoded = [torchvision.io.decode_jpeg(buf, device="cuda") for buf in jpeg_buffers]
-        stacked = torch.stack(decoded)
-        if stacked.shape[-2:] != (560, 1008):
+        stacked = torch.stack(
+            [torchvision.io.decode_jpeg(j, device="cuda") for j in jpegs]
+        )  # [n_cams * n_frames, 3, H, W]
+        if stacked.shape[-2:] != _MODEL_INPUT_SIZE:
             stacked = (
                 torch.nn.functional.interpolate(
-                    stacked.float(), size=(560, 1008), mode="bicubic", align_corners=False
+                    stacked.float(), size=_MODEL_INPUT_SIZE, mode="bicubic", align_corners=False
                 )
                 .clamp(0, 255)
                 .to(torch.uint8)
@@ -448,35 +404,61 @@ class TeleAlpaNode(Node):
 
     def _build_ego_history(
         self,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[np.ndarray]]:
-        """Ego motion in the t0 local frame + the raw map-frame position at t0.
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[np.ndarray]]:
+        """Ego motion in the t0 local frame + raw map-frame position at t0.
 
-        Returns ``(xyz, rot, ego_pos_map)`` or ``(None, None, None)`` if not
-        enough odometry has been buffered yet.
+        ``(xyz, rot, ego_pos_map)`` shaped ``(1, 1, T, 3)`` / ``(1, 1, T, 3, 3)``,
+        or ``(None, None, None)`` if not enough odometry has been buffered.
         """
-        need = self._num_history_steps * self.skip_num
-        if len(self._odometry_buffer) < need:
+        need = self._num_history_steps * self._odom_skip
+        if len(self._odom_buffer) < need:
             return None, None, None
 
-        odom_history = list(self._odometry_buffer)[-need :: self.skip_num]
+        history = list(self._odom_buffer)[-need :: self._odom_skip]
         positions, rotations = [], []
-        for msg in odom_history:
-            pose = msg.pose.pose
-            positions.append([pose.position.x, pose.position.y, pose.position.z])
+        for msg in history:
+            p = msg.pose.pose
+            positions.append([p.position.x, p.position.y, p.position.z])
             rotations.append(
                 Rotation.from_quat(
-                    [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+                    [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]
                 ).as_matrix()
             )
-        positions_np = np.asarray(positions, dtype=np.float32)
-        rotations_np = np.asarray(rotations, dtype=np.float32)
-        t0_rot_inv = np.linalg.inv(rotations_np[-1])
-        history_xyz_local = (positions_np - positions_np[-1]) @ t0_rot_inv.T
-        history_rot_local = np.einsum("ij,njk->nik", t0_rot_inv, rotations_np)
+        positions = np.asarray(positions, dtype=np.float32)
+        rotations = np.asarray(rotations, dtype=np.float32)
+        t0_rot_inv = np.linalg.inv(rotations[-1])
+        xyz_local = (positions - positions[-1]) @ t0_rot_inv.T
+        rot_local = np.einsum("ij,njk->nik", t0_rot_inv, rotations)
 
-        xyz = torch.from_numpy(history_xyz_local).unsqueeze(0).unsqueeze(0)
-        rot = torch.from_numpy(history_rot_local).unsqueeze(0).unsqueeze(0)
-        return xyz, rot, positions_np[-1]
+        xyz = torch.from_numpy(xyz_local).unsqueeze(0).unsqueeze(0)
+        rot = torch.from_numpy(rot_local).unsqueeze(0).unsqueeze(0)
+        return xyz, rot, positions[-1]
+
+    def _tokenize(self, messages: list) -> dict:
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            continue_final_message=True,
+            return_dict=True,
+            return_tensors="pt",
+            device="cuda",
+        )
+        return {k: v.to(self._device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+    @staticmethod
+    def _span(extra: dict, key: str) -> str:
+        """Stripped text for ``key``, robust to the ``[B,ns,nj]`` (trajectory)
+        and ``[B,ns]`` (generate_text) array shapes."""
+        if not extra or key not in extra:
+            return ""
+        try:
+            value = np.asarray(extra[key]).reshape(-1)[0]
+        except Exception:
+            return ""
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        return str(value).strip()
 
     # ------------------------------------------------------------------ #
     # Trajectory path                                                   #
@@ -486,17 +468,14 @@ class TeleAlpaNode(Node):
         if self._active_future and not self._active_future.done():
             return
         # Yield the shared GPU worker to an unanswered question. Both timers gate
-        # on `_active_future`, and this one is registered first and fires more
-        # often, so without this it wins every race and VQA never runs.
-        if (
-            self._vqa_enabled
-            and self._question
-            and self._question != self._last_answered_question
-        ):
+        # on `_active_future`, and this one fires more often, so without this it
+        # wins every race and VQA never runs.
+        if self._vqa_enabled and self._question and self._question != self._last_answered_question:
             return
         if self._require_new_data and self._rx_count == self._last_traj_rx:
             return
-        frames = self._prepare_image_frames()
+
+        frames = self._decode_latest_frames()
         if frames is None:
             return
         ego_xyz, ego_rot, ego_pos_map = self._build_ego_history()
@@ -506,10 +485,9 @@ class TeleAlpaNode(Node):
         nav_text = self._compute_nav_text(ego_pos_map)
         if nav_text and nav_text != self._nav_text:
             self._nav_text = nav_text
-            self.get_logger().info(f"Navigation instruction: {nav_text}")
+            self.get_logger().info(f"navigation: {nav_text}")
 
         self._last_traj_rx = self._rx_count
-        self.get_logger().info(f"Starting trajectory inference. nav_text={self._nav_text}")
         self._active_future = self._executor.submit(
             self._run_trajectory, frames, ego_xyz, ego_rot, self._nav_text
         )
@@ -518,8 +496,8 @@ class TeleAlpaNode(Node):
     def _run_trajectory(
         self,
         frames: torch.Tensor,
-        ego_history_xyz: torch.Tensor,
-        ego_history_rot: torch.Tensor,
+        ego_xyz: torch.Tensor,
+        ego_rot: torch.Tensor,
         nav_text: Optional[str],
     ) -> dict:
         start = time.time()
@@ -529,75 +507,52 @@ class TeleAlpaNode(Node):
             num_frames_per_camera=self._num_frames,
             nav_text=nav_text,
         )
-        processor_inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            continue_final_message=True,
-            return_dict=True,
-            return_tensors="pt",
-            device="cuda",
-        )
-        processor_inputs = {
-            k: v.to(self._device) if hasattr(v, "to") else v
-            for k, v in processor_inputs.items()
-        }
         model_inputs = helper.to_device(
             {
-                "tokenized_data": processor_inputs,
-                "ego_history_xyz": ego_history_xyz,
-                "ego_history_rot": ego_history_rot,
+                "tokenized_data": self._tokenize(messages),
+                "ego_history_xyz": ego_xyz,
+                "ego_history_rot": ego_rot,
             },
             device=self._device,
         )
 
-        generation_kwargs = {
-            "top_p": self._top_p,
-            "temperature": self._temperature,
-            "num_traj_samples": 1,
-            "num_traj_sets": 1,
-            "max_generation_length": self._max_gen_len,
-            "return_extra": True,
-        }
+        kwargs = dict(
+            top_p=self._top_p,
+            temperature=self._temperature,
+            num_traj_samples=1,
+            num_traj_sets=1,
+            max_generation_length=self._cot_max_gen_len,
+            return_extra=True,
+        )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            if nav_text:
-                pred_xyz, pred_rot, extra = (
-                    self._model.sample_trajectories_from_data_with_vlm_rollout_cfg_nav(
-                        data=model_inputs, **generation_kwargs
-                    )
-                )
-            else:
-                pred_xyz, pred_rot, extra = (
-                    self._model.sample_trajectories_from_data_with_vlm_rollout(
-                        data=model_inputs, **generation_kwargs
-                    )
-                )
+            sampler = (
+                self._model.sample_trajectories_from_data_with_vlm_rollout_cfg_nav
+                if nav_text
+                else self._model.sample_trajectories_from_data_with_vlm_rollout
+            )
+            pred_xyz, pred_rot, extra = sampler(data=model_inputs, **kwargs)
 
         trajectory = pred_xyz.detach().cpu()[0, 0, 0]
         rotation = pred_rot.detach().cpu()[0, 0, 0]
         traj_msg = self._to_autoware_trajectory(trajectory, rotation)
-        self._trajectory_pub.publish(traj_msg)
-        self._marker_pub.publish(self._trajectory_to_markers(trajectory))
+        self._traj_pub.publish(traj_msg)
+        self._marker_pub.publish(self._trajectory_markers(trajectory))
 
         if nav_text:
-            m = String()
-            m.data = nav_text
-            self._nav_text_pub.publish(m)
+            self._nav_text_pub.publish(String(data=nav_text))
 
-        cot_text = self._extract_text(extra, "cot")
-        if cot_text:
-            m = String()
-            m.data = cot_text
-            self._cot_pub.publish(m)
-            s = StringStamped()
-            s.stamp = traj_msg.header.stamp
-            s.data = cot_text
-            self._cot_stamped_pub.publish(s)
+        reasoning = self._span(extra, "cot")
+        if reasoning:
+            self._reasoning_pub.publish(String(data=reasoning))
+            self._reasoning_stamped_pub.publish(
+                StringStamped(stamp=traj_msg.header.stamp, data=reasoning)
+            )
 
         return {
             "kind": "trajectory",
             "duration_sec": time.time() - start,
             "num_poses": len(traj_msg.points),
+            "reasoning_chars": len(reasoning),
         }
 
     # ------------------------------------------------------------------ #
@@ -618,7 +573,8 @@ class TeleAlpaNode(Node):
             and self._rx_count == self._last_vqa_rx
         ):
             return
-        frames = self._prepare_image_frames()
+
+        frames = self._decode_latest_frames()
         if frames is None:
             return
 
@@ -626,15 +582,14 @@ class TeleAlpaNode(Node):
         if self._vqa_use_traj:
             ego_xyz, ego_rot, _ = self._build_ego_history()
             if ego_xyz is None and not self._warned_no_odom:
-                self.get_logger().warn(
-                    "No ego-motion history yet — answering without trajectory input."
+                self.get_logger().warning(
+                    "no ego-motion history yet — answering without trajectory input"
                 )
                 self._warned_no_odom = True
 
-        self._last_vqa_rx = self._rx_count
-        self._last_answered_question = self._question
         question = self._question
-        self.get_logger().info(f"Running VQA for question: {question!r}")
+        self._last_vqa_rx = self._rx_count
+        self._last_answered_question = question
         self._active_future = self._executor.submit(
             self._run_vqa, question, frames, ego_xyz, ego_rot
         )
@@ -656,36 +611,28 @@ class TeleAlpaNode(Node):
             camera_indices=self._camera_indices,
             num_frames_per_camera=self._num_frames,
         )
+        if self._vqa_system_prompt:
+            for item in messages[0]["content"]:
+                if item.get("type") == "text":
+                    item["text"] = self._vqa_system_prompt
+                    break
         if with_traj:
+            # Prepend the ego trajectory-history placeholder to the question text.
             for item in reversed(messages[1]["content"]):
                 if item.get("type") == "text":
                     item["text"] = _HIST_TRAJ_PLACEHOLDER + item["text"]
                     break
 
-        processor_inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            continue_final_message=True,
-            return_dict=True,
-            return_tensors="pt",
-            device="cuda",
-        )
-        processor_inputs = {
-            k: v.to(self._device) if hasattr(v, "to") else v
-            for k, v in processor_inputs.items()
-        }
+        tokenized = self._tokenize(messages)
         if with_traj:
-            traj_data = {
-                "ego_history_xyz": ego_xyz.to(self._device),
-                "ego_history_rot": ego_rot.to(self._device),
-            }
-            processor_inputs["input_ids"] = self._model.fuse_traj_tokens(
-                processor_inputs["input_ids"], traj_data
+            tokenized["input_ids"] = self._model.fuse_traj_tokens(
+                tokenized["input_ids"],
+                {
+                    "ego_history_xyz": ego_xyz.to(self._device),
+                    "ego_history_rot": ego_rot.to(self._device),
+                },
             )
-        model_inputs = helper.to_device(
-            {"tokenized_data": processor_inputs}, device=self._device
-        )
+        model_inputs = helper.to_device({"tokenized_data": tokenized}, device=self._device)
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             extra = self._model.generate_text(
@@ -696,66 +643,91 @@ class TeleAlpaNode(Node):
                 max_generation_length=self._vqa_max_gen_len,
             )
 
-        answer, answer_ok = self._pick_answer(extra)
-        if not answer_ok:
-            # The model never closed `<|answer_end|>` within the token budget, so
-            # the parsed span is empty. Publish a visible diagnostic rather than a
-            # silent empty string, and tell the user which knob to turn.
+        answer, source = self._pick_answer(extra)
+        if source is None:
             answer = (
-                f"[no answer: model did not emit <|answer_end|> within "
-                f"{self._vqa_max_gen_len} tokens — raise vqa_max_generation_length]"
+                f"[no answer: model produced no closed <|answer_end|> / <|cot_end|> "
+                f"span within {self._vqa_max_gen_len} tokens — raise "
+                f"vqa_max_generation_length, or set vqa_use_trajectory_input:=false]"
             )
             self.get_logger().warning(answer)
+        elif source != "answer" and not with_traj:
+            # Pure VQA mode: we expect a real `<|answer_start|>..<|answer_end|>`
+            # span. Falling back to a planning span means the answer span never
+            # closed — flag it and mark the text so it is not mistaken for a
+            # direct reply.
+            self.get_logger().warning(
+                f"no <|answer_end|> span; using extra[{source!r}] "
+                f"(raise vqa_max_generation_length for a clean answer)"
+            )
+            answer = f"[{source}] {answer}"
+        # With `vqa_use_trajectory_input` on the model runs a trajectory-aware
+        # rollout, so a `cot` / `meta_action` span *is* the expected reply — take
+        # it as-is (source is still reported in the log + metrics).
 
-        now = self.get_clock().now().to_msg()
-        m = String()
-        m.data = answer
-        self._answer_pub.publish(m)
-        s = StringStamped()
-        s.stamp = now
-        s.data = answer
-        self._answer_stamped_pub.publish(s)
+        stamp = self.get_clock().now().to_msg()
+        self._answer_pub.publish(String(data=answer))
+        self._answer_stamped_pub.publish(StringStamped(stamp=stamp, data=answer))
 
         return {
             "kind": "vqa",
             "duration_sec": time.time() - start,
             "question": question,
-            "answer": answer if answer_ok else "",
+            "answer": answer,
+            "answer_source": source or "none",
             "with_traj": with_traj,
         }
 
     @staticmethod
-    def _pick_answer(extra: dict) -> tuple[str, bool]:
-        """First non-empty text span from the generate_text output.
+    def _pick_answer(extra: dict) -> Tuple[str, Optional[str]]:
+        """First non-empty text span from ``generate_text``.
 
-        Returns ``(text, ok)``; ``ok`` is False when every field was empty
-        (usually a missing ``<|answer_end|>``), so callers can distinguish
-        "model said nothing" from a genuine short answer.
+        Returns ``(text, source)``; ``source`` is the ``extra`` key the text came
+        from (``"answer"`` is the real reply, ``"meta_action"`` / ``"cot"`` are
+        planning fallbacks) or ``None`` if every field was empty.
         """
         for key in ("answer", "meta_action", "cot"):
-            if key not in extra:
-                continue
-            try:
-                value = str(extra[key][0, 0]).strip()
-            except Exception:
-                continue
+            value = TeleAlpaNode._span(extra, key)
             if value:
-                return value, True
-        return "", False
+                return value, key
+        return "", None
 
     # ------------------------------------------------------------------ #
-    # Output helpers + completion                                       #
+    # Completion + output builders                                      #
     # ------------------------------------------------------------------ #
+
+    def _on_future_done(self, future: Future) -> None:
+        try:
+            metrics = future.result()
+        except Exception as exc:  # noqa: BLE001 — surface any inference failure
+            self.get_logger().error(f"inference failed: {exc}")
+            return
+        if not metrics:
+            return
+        if metrics["kind"] == "vqa":
+            src = metrics["answer_source"]
+            traj_note = "" if metrics["with_traj"] else " [no traj input]"
+            src_note = "" if src == "answer" else f" [source={src}]"
+            self.get_logger().info(
+                f"VQA {metrics['duration_sec']:.2f}s{traj_note}{src_note}\n"
+                f"  Q: {metrics['question']}\n"
+                f"  A: {metrics['answer'] or '(empty)'}"
+            )
+        else:
+            self.get_logger().info(
+                f"trajectory {metrics['duration_sec']:.2f}s "
+                f"(points={metrics['num_poses']}, reasoning={metrics['reasoning_chars']} chars)"
+            )
 
     def _to_autoware_trajectory(
-        self, trajectory: torch.Tensor, rotations: torch.Tensor | None
+        self, trajectory: torch.Tensor, rotations: Optional[torch.Tensor]
     ) -> Trajectory:
         traj_np = trajectory.numpy()
         rot_np = rotations.numpy() if rotations is not None else None
 
-        traj_msg = Trajectory()
-        traj_msg.header.stamp = self.get_clock().now().to_msg()
-        traj_msg.header.frame_id = self._frame_id
+        msg = Trajectory()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._frame_id
 
         dt = 0.1
         prev_xy = None
@@ -765,11 +737,11 @@ class TeleAlpaNode(Node):
             tp.pose.position.y = float(point[1])
             tp.pose.position.z = float(point[2])
             if rot_np is not None:
-                quat = Rotation.from_matrix(rot_np[idx]).as_quat()
-                tp.pose.orientation.x = float(quat[0])
-                tp.pose.orientation.y = float(quat[1])
-                tp.pose.orientation.z = float(quat[2])
-                tp.pose.orientation.w = float(quat[3])
+                q = Rotation.from_matrix(rot_np[idx]).as_quat()
+                tp.pose.orientation.x = float(q[0])
+                tp.pose.orientation.y = float(q[1])
+                tp.pose.orientation.z = float(q[2])
+                tp.pose.orientation.w = float(q[3])
             else:
                 tp.pose.orientation.w = 1.0
 
@@ -778,71 +750,88 @@ class TeleAlpaNode(Node):
             else:
                 speed = math.hypot(point[0] - prev_xy[0], point[1] - prev_xy[1]) / dt
             tp.longitudinal_velocity_mps = float(speed)
-            tp.lateral_velocity_mps = 0.0
-            tp.acceleration_mps2 = 0.0
-            tp.heading_rate_rps = 0.0
 
-            seconds_float = idx * dt
-            seconds_int = int(seconds_float)
-            tp.time_from_start = Duration(
-                sec=seconds_int, nanosec=int((seconds_float - seconds_int) * 1e9)
-            )
-            traj_msg.points.append(tp)
+            secs = idx * dt
+            tp.time_from_start = Duration(sec=int(secs), nanosec=int((secs % 1.0) * 1e9))
+            msg.points.append(tp)
             prev_xy = (point[0], point[1])
-        return traj_msg
+        return msg
 
-    def _trajectory_to_markers(self, trajectory: torch.Tensor) -> MarkerArray:
-        traj_np = trajectory.numpy()
-        line_marker = Marker()
-        line_marker.header.stamp = self.get_clock().now().to_msg()
-        line_marker.header.frame_id = self._frame_id
-        line_marker.ns = "trajectory"
-        line_marker.id = 0
-        line_marker.type = Marker.LINE_STRIP
-        line_marker.action = Marker.ADD
-        line_marker.scale.x = 1.0
-        line_marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-        line_marker.pose.orientation.w = 1.0
-        for point in traj_np:
-            p = Point()
-            p.x, p.y, p.z = float(point[0]), float(point[1]), float(point[2])
-            line_marker.points.append(p)
-        marker_array = MarkerArray()
-        marker_array.markers.append(line_marker)
-        return marker_array
+    def _trajectory_markers(self, trajectory: torch.Tensor) -> MarkerArray:
+        line = Marker()
+        line.header.stamp = self.get_clock().now().to_msg()
+        line.header.frame_id = self._frame_id
+        line.ns = "trajectory"
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.scale.x = 1.0
+        line.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        line.pose.orientation.w = 1.0
+        for point in trajectory.numpy():
+            line.points.append(Point(x=float(point[0]), y=float(point[1]), z=float(point[2])))
+        markers = MarkerArray()
+        markers.markers.append(line)
+        return markers
 
-    def _extract_text(self, extra: dict, key: str) -> Optional[str]:
-        if not extra or key not in extra:
-            return None
-        try:
-            text = extra[key][0, 0, 0]
-        except Exception:
-            return None
-        if isinstance(text, bytes):
-            text = text.decode("utf-8", errors="ignore")
-        text = str(text).strip()
-        return text or None
+    # ------------------------------------------------------------------ #
+    # Lanelet2 map + navigation text                                    #
+    # ------------------------------------------------------------------ #
 
-    def _on_future_done(self, future: Future) -> None:
-        try:
-            metrics = future.result()
-        except Exception as exc:  # noqa: BLE001 — surface any inference failure
-            self.get_logger().error(f"tele_alpa inference failed: {exc}")
-            return
-        if not metrics:
-            return
-        if metrics.get("kind") == "vqa":
-            note = "" if metrics.get("with_traj") else " [no trajectory input]"
-            self.get_logger().info(
-                f"VQA answered in {metrics['duration_sec']:.2f}s{note}\n"
-                f"  Q: {metrics['question']}\n"
-                f"  A: {metrics['answer'] or '(empty — raise vqa_max_generation_length)'}"
+    def _load_lanelet2_map(self, map_path: str) -> None:
+        if not _HAS_LANELET2:
+            self.get_logger().warning(
+                "lanelet2 bindings unavailable — navigation text disabled"
             )
-        else:
-            self.get_logger().info(
-                f"Trajectory inference completed in {metrics['duration_sec']:.2f}s "
-                f"(points={metrics.get('num_poses', 0)})."
-            )
+            return
+        self.get_logger().info(f"loading lanelet2 map: {map_path}")
+        projection = MGRSProjector(lanelet2.io.Origin(0.0, 0.0))
+        ll2_map = lanelet2.io.load(map_path, projection)
+
+        info: dict = {}
+        for ll in ll2_map.laneletLayer:
+            attrs = ll.attributes
+            subtype = attrs["subtype"] if "subtype" in attrs else ""
+            if subtype not in ("road", "highway", "road_shoulder", "bicycle_lane"):
+                continue
+            centerline = np.array([(p.x, p.y, p.z) for p in ll.centerline])
+            info[ll.id] = {
+                "centerline": centerline,
+                "turn_direction": attrs["turn_direction"] if "turn_direction" in attrs else "",
+                "center": np.mean(centerline[:, :2], axis=0),
+            }
+        self._lanelet_map = info
+        self.get_logger().info(f"lanelet2 map: {len(info)} road lanelets")
+
+    def _compute_nav_text(self, ego_pos_map: Optional[np.ndarray]) -> Optional[str]:
+        if self._lanelet_map is None or not self._route_lanelet_ids or ego_pos_map is None:
+            return None
+        ego_xy = ego_pos_map[:2]
+
+        best_idx, best_dist = 0, float("inf")
+        for i, ll_id in enumerate(self._route_lanelet_ids):
+            entry = self._lanelet_map.get(ll_id)
+            if entry is None:
+                continue
+            dist = np.linalg.norm(entry["centerline"][0, :2] - ego_xy)
+            if dist < best_dist:
+                best_dist, best_idx = dist, i
+
+        current = self._lanelet_map.get(self._route_lanelet_ids[best_idx])
+        if current is not None and current["turn_direction"] in ("left", "right"):
+            return f"Turn {current['turn_direction']}"
+
+        cumulative, prev_pt = 0.0, ego_xy
+        for i in range(best_idx + 1, len(self._route_lanelet_ids)):
+            entry = self._lanelet_map.get(self._route_lanelet_ids[i])
+            if entry is None:
+                continue
+            first_pt = entry["centerline"][0, :2]
+            cumulative += np.linalg.norm(first_pt - prev_pt)
+            prev_pt = first_pt
+            if entry["turn_direction"] in ("left", "right"):
+                return f"Turn {entry['turn_direction']} in {int(round(cumulative))}m"
+        return "Continue straight"
 
     def destroy_node(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -858,7 +847,8 @@ def main(args: Optional[List[str]] = None) -> None:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
