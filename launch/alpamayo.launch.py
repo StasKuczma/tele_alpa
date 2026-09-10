@@ -30,6 +30,7 @@ def generate_launch_description() -> LaunchDescription:
                         "cot_topic": "/alpamayo/reasoning",
                         "cot_with_stamped_topic": "/alpamayo/reasoning_stamped",
                         "inference_period_sec": 1.0,
+                        "require_new_data": True,
                     }
                 ],
             )

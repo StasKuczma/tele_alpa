@@ -42,8 +42,11 @@ def generate_launch_description() -> LaunchDescription:
                         "answer_stamped_topic": "/tele_alpa/answer_stamped",
                         "camera_topics": default_camera_topics,
                         "camera_indices": default_camera_indices,
+                        "odometry_topic": "/localization/kinematic_state",
+                        "use_trajectory_input": True,
                         "inference_period_sec": 2.0,
                         "answer_once": False,
+                        "require_new_data": True,
                         "use_greedy_decode": True,
                         "max_generation_length": 256,
                     }

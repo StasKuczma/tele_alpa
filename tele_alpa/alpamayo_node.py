@@ -85,6 +85,9 @@ class AlpamayoRosNode(Node):
         # ``scripts/build_trt_expert_engine.py`` to swap in a TrtExpertEngine
         # runtime for the 5-step diffusion inner loop.
         self.declare_parameter("expert_onnx_path", "")
+        # Only run inference when a new camera frame has arrived since the last
+        # run. Stops the node re-inferring on a frozen buffer after a bag ends.
+        self.declare_parameter("require_new_data", True)
 
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
@@ -120,6 +123,12 @@ class AlpamayoRosNode(Node):
 
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._active_future: Optional[Future] = None
+
+        self._require_new_data = bool(self.get_parameter("require_new_data").value)
+        # Monotonic count of camera messages received; frozen once the stream
+        # stops. ``_last_run_rx_count`` is the value at the previous inference.
+        self._rx_count = 0
+        self._last_run_rx_count = -1
 
         self._frame_id = "base_link"
 
@@ -346,9 +355,12 @@ class AlpamayoRosNode(Node):
     def _timer_callback(self) -> None:
         if self._active_future and not self._active_future.done():
             return
+        if self._require_new_data and self._rx_count == self._last_run_rx_count:
+            return
         payload = self._prepare_inference_payload()
         if payload is None:
             return
+        self._last_run_rx_count = self._rx_count
         nav_text = payload.get("nav_text")
         self.get_logger().info(
             f"Starting Alpamayo inference from streaming data. nav_text={nav_text}"
@@ -362,6 +374,7 @@ class AlpamayoRosNode(Node):
         # + F.interpolate. Saves ~150 ms/frame vs cv2.imdecode + CPU copy.
         jpeg_bytes = torch.frombuffer(bytearray(msg.data), dtype=torch.uint8)
         self._camera_buffers[topic].append((msg.header.stamp, jpeg_bytes))
+        self._rx_count += 1
 
     def _odometry_callback(self, msg: Odometry) -> None:
         self._odometry_buffer.append(msg)

@@ -23,11 +23,14 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional
 
+import numpy as np
 import rclpy
 import torch
 from autoware_internal_debug_msgs.msg import StringStamped
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
@@ -35,6 +38,17 @@ from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
 DEFAULT_QUESTION = "What should the ego vehicle do next, and why?"
+
+# Ego trajectory-history placeholder, identical to the one
+# ``helper.create_message`` builds for the trajectory node. ``fuse_traj_tokens``
+# replaces these pad tokens with the encoded ego-motion history so the VLM sees
+# the same trajectory input during VQA that it gets during planning.
+_NUM_TRAJ_HISTORY_TOKENS = 48
+_HIST_TRAJ_PLACEHOLDER = (
+    "<|traj_history_start|>"
+    + "<|traj_history|>" * _NUM_TRAJ_HISTORY_TOKENS
+    + "<|traj_history_end|>"
+)
 
 
 class AlpamayoVqaNode(Node):
@@ -50,10 +64,19 @@ class AlpamayoVqaNode(Node):
         self.declare_parameter("answer_topic", "/tele_alpa/answer")
         self.declare_parameter("answer_stamped_topic", "/tele_alpa/answer_stamped")
         self.declare_parameter("inference_period_sec", 2.0)
+        # Feed the ego-motion history into the model (same trajectory input the
+        # planning node uses). Best-effort: if no odometry has been received the
+        # node still answers, just without the trajectory tokens.
+        self.declare_parameter("odometry_topic", "/localization/kinematic_state")
+        self.declare_parameter("use_trajectory_input", True)
         # When True, run one inference each time the question changes and then
         # stay idle. When False (default), keep re-answering the current
         # question every ``inference_period_sec`` as the scene evolves.
         self.declare_parameter("answer_once", False)
+        # Only run when a new camera frame has arrived since the last inference.
+        # Stops the node re-answering on a frozen buffer once a recording / bag
+        # ends. A question change still forces one answer on the latest frames.
+        self.declare_parameter("require_new_data", True)
 
         # ROS2 Jazzy: non-empty default for string-array params to infer type.
         self.declare_parameter("camera_topics", [""])
@@ -73,10 +96,20 @@ class AlpamayoVqaNode(Node):
         self._dtype = torch.bfloat16
 
         self._num_frames = 4
+        self._num_history_steps = 16
+        # /localization/kinematic_state is ~50 Hz; the model expects 10 Hz.
+        self._odom_skip = 5
 
         self._question = str(self.get_parameter("question").value or DEFAULT_QUESTION)
         self._answer_once = bool(self.get_parameter("answer_once").value)
+        self._require_new_data = bool(self.get_parameter("require_new_data").value)
+        self._use_trajectory_input = bool(self.get_parameter("use_trajectory_input").value)
+        self._warned_no_odom = False
         self._last_answered_question: Optional[str] = None
+        # Monotonic count of camera messages received; frozen once the stream
+        # stops. ``_last_run_rx_count`` is the value at the previous inference.
+        self._rx_count = 0
+        self._last_run_rx_count = -1
 
         queue_size = 10
         answer_topic = self.get_parameter("answer_topic").value
@@ -128,6 +161,22 @@ class AlpamayoVqaNode(Node):
             )
             self.get_logger().info(f"Subscribed to camera topic: {topic}")
 
+        # --- Odometry (ego trajectory history for the model) ---
+        self._odometry_buffer: deque = deque(
+            maxlen=self._num_history_steps * self._odom_skip + 10
+        )
+        if self._use_trajectory_input:
+            odom_topic = self.get_parameter("odometry_topic").value
+            odom_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=50,
+            )
+            self.create_subscription(Odometry, odom_topic, self._odometry_callback, odom_qos)
+            self.get_logger().info(f"Subscribed to odometry topic: {odom_topic}")
+        else:
+            self.get_logger().info("Trajectory input disabled (use_trajectory_input:=false).")
+
         # --- Model load ---
         self.get_logger().info(
             f"Loading Alpamayo model {self.model_name} on device={self._device} dtype={self._dtype}"
@@ -167,6 +216,45 @@ class AlpamayoVqaNode(Node):
     def _image_callback(self, topic: str, msg: CompressedImage) -> None:
         jpeg_bytes = torch.frombuffer(bytearray(msg.data), dtype=torch.uint8)
         self._camera_buffers[topic].append((msg.header.stamp, jpeg_bytes))
+        self._rx_count += 1
+
+    def _odometry_callback(self, msg: Odometry) -> None:
+        self._odometry_buffer.append(msg)
+
+    def _build_ego_history(self) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Ego-motion history in the t0 local frame, as the trajectory node builds it.
+
+        Returns ``(xyz, rot)`` shaped ``(1, 1, num_history_steps, 3)`` /
+        ``(1, 1, num_history_steps, 3, 3)``, or ``(None, None)`` if not enough
+        odometry has been buffered yet.
+        """
+        need = self._num_history_steps * self._odom_skip
+        if len(self._odometry_buffer) < need:
+            return None, None
+
+        odom_history = list(self._odometry_buffer)[-need :: self._odom_skip]
+        positions, rotations = [], []
+        for msg in odom_history:
+            pose = msg.pose.pose
+            positions.append([pose.position.x, pose.position.y, pose.position.z])
+            quat = [
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ]
+            rotations.append(Rotation.from_quat(quat).as_matrix())
+
+        positions_np = np.asarray(positions, dtype=np.float32)
+        rotations_np = np.asarray(rotations, dtype=np.float32)
+        t0_rot_inv = np.linalg.inv(rotations_np[-1])
+        centered = positions_np - positions_np[-1]
+        history_xyz_local = centered @ t0_rot_inv.T
+        history_rot_local = np.einsum("ij,njk->nik", t0_rot_inv, rotations_np)
+
+        xyz = torch.from_numpy(history_xyz_local).unsqueeze(0).unsqueeze(0)
+        rot = torch.from_numpy(history_rot_local).unsqueeze(0).unsqueeze(0)
+        return xyz, rot
 
     def _question_callback(self, msg: String) -> None:
         question = msg.data.strip()
@@ -183,9 +271,19 @@ class AlpamayoVqaNode(Node):
             return
         if self._answer_once and self._question == self._last_answered_question:
             return
+        # Skip if no new frames since the last run — unless the question is still
+        # unanswered, in which case answer once on whatever frames we have.
+        question_pending = self._question != self._last_answered_question
+        if (
+            self._require_new_data
+            and not question_pending
+            and self._rx_count == self._last_run_rx_count
+        ):
+            return
         payload = self._prepare_payload()
         if payload is None:
             return
+        self._last_run_rx_count = self._rx_count
         self._last_answered_question = payload["question"]
         self.get_logger().info(f"Running VQA for question: {payload['question']!r}")
         self._active_future = self._executor.submit(self._run_inference, payload)
@@ -224,12 +322,30 @@ class AlpamayoVqaNode(Node):
         ]
         image_frames = torch.stack(camera_tensors, dim=0)  # [n_cams, n_frames, 3, H, W]
 
-        return {"image_frames": image_frames, "question": self._question}
+        ego_xyz, ego_rot = (None, None)
+        if self._use_trajectory_input:
+            ego_xyz, ego_rot = self._build_ego_history()
+            if ego_xyz is None and not self._warned_no_odom:
+                self.get_logger().warn(
+                    "No ego-motion history yet — answering without trajectory input. "
+                    "Check the odometry_topic parameter."
+                )
+                self._warned_no_odom = True
+
+        return {
+            "image_frames": image_frames,
+            "question": self._question,
+            "ego_history_xyz": ego_xyz,
+            "ego_history_rot": ego_rot,
+        }
 
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
         frames = payload["image_frames"]
         question = payload["question"]
+        ego_xyz = payload.get("ego_history_xyz")
+        ego_rot = payload.get("ego_history_rot")
+        with_traj = ego_xyz is not None and ego_rot is not None
 
         messages = helper.create_vqa_message(
             frames.flatten(0, 1),
@@ -237,6 +353,14 @@ class AlpamayoVqaNode(Node):
             camera_indices=self._camera_indices,
             num_frames_per_camera=self._num_frames,
         )
+        if with_traj:
+            # Prepend the ego trajectory-history placeholder to the question text
+            # (same tokens helper.create_message builds for the planning node).
+            for item in reversed(messages[1]["content"]):
+                if item.get("type") == "text":
+                    item["text"] = _HIST_TRAJ_PLACEHOLDER + item["text"]
+                    break
+
         processor_inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -250,6 +374,15 @@ class AlpamayoVqaNode(Node):
             k: v.to(self._device) if hasattr(v, "to") else v
             for k, v in processor_inputs.items()
         }
+        if with_traj:
+            # Replace the <|traj_history|> pad tokens with the encoded ego motion.
+            traj_data = {
+                "ego_history_xyz": ego_xyz.to(self._device),
+                "ego_history_rot": ego_rot.to(self._device),
+            }
+            processor_inputs["input_ids"] = self._model.fuse_traj_tokens(
+                processor_inputs["input_ids"], traj_data
+            )
         model_inputs = helper.to_device(
             {"tokenized_data": processor_inputs}, device=self._device
         )
@@ -275,7 +408,12 @@ class AlpamayoVqaNode(Node):
         stamped.data = answer
         self._answer_stamped_pub.publish(stamped)
 
-        return {"duration_sec": time.time() - start, "question": question, "answer": answer}
+        return {
+            "duration_sec": time.time() - start,
+            "question": question,
+            "answer": answer,
+            "with_traj": with_traj,
+        }
 
     @staticmethod
     def _pick_answer(extra: dict) -> str:
@@ -299,8 +437,9 @@ class AlpamayoVqaNode(Node):
             return
         if not metrics:
             return
+        traj_note = "" if metrics.get("with_traj") else " [no trajectory input]"
         self.get_logger().info(
-            f"VQA answered in {metrics['duration_sec']:.2f}s\n"
+            f"VQA answered in {metrics['duration_sec']:.2f}s{traj_note}\n"
             f"  Q: {metrics['question']}\n"
             f"  A: {metrics['answer'] or '(empty — try a larger max_generation_length)'}"
         )

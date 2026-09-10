@@ -26,8 +26,12 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            # Primary: one model, trajectory planning + VQA in a single process.
+            "tele_alpa_node = tele_alpa.tele_alpa_node:main",
+            # Optional single-capability nodes (each loads its own model).
             "alpamayo_node = tele_alpa.alpamayo_node:main",
             "vqa_node = tele_alpa.vqa_node:main",
+            # CLI helper to ask a one-off question.
             "ask = tele_alpa.ask:main",
         ],
     },
