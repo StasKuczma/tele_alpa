@@ -4,13 +4,32 @@
 
 """One ROS 2 node, one Alpamayo 1.5 model, two outputs:
 
-* an Autoware trajectory (+ chain-of-thought / RViz markers / nav text), and
+* an Autoware trajectory (+ chain-of-thought "reasoning" / RViz markers / nav
+  text), and
 * answers to free-form questions about the live scene (VQA).
 
 The 10B model is loaded **once**. The trajectory path and the VQA path share a
 single-worker executor, so they never run on the GPU at the same time, and they
 consume the same buffered input — a 4-camera x 4-frame image stack plus the ego
 trajectory history.
+
+Reasoning vs. VQA
+-----------------
+Both are text from the same model over the same images, but they come from
+different prompts and different decode routines:
+
+* **Reasoning (chain-of-thought)** is a by-product of *planning*. The planning
+  prompt (``helper.create_message``) seeds ``<|cot_start|>`` and asks the model
+  to "output the chain-of-thought reasoning of the driving process, then output
+  the future trajectory". ``sample_trajectories_*`` runs that rollout, decodes
+  the ``<i..>`` trajectory tokens into a path, and returns the free-text spans
+  as ``extra["cot"]`` / ``extra["meta_action"]``. It explains *why this
+  trajectory* — it does not answer a question. Published on ``cot_topic``.
+* **VQA** is standalone Q&A. ``helper.create_vqa_message`` wraps your question in
+  ``<|question_start|>..<|question_end|>`` and seeds ``<|answer_start|>``;
+  ``model.generate_text`` does plain autoregressive decoding (no diffusion, no
+  trajectory tokens) and returns ``extra["answer"]``. Text only, no trajectory.
+  Published on ``answer_topic``.
 """
 
 from __future__ import annotations
@@ -105,7 +124,9 @@ class TeleAlpaNode(Node):
         self.declare_parameter("vqa_period_sec", 2.0)
         # Answer once per question change, then idle (vs. re-answer every tick).
         self.declare_parameter("answer_once", False)
-        self.declare_parameter("vqa_max_generation_length", 256)
+        # Token budget for the answer. If the model does not emit `<|answer_end|>`
+        # within this many tokens the parsed answer is empty, so keep it roomy.
+        self.declare_parameter("vqa_max_generation_length", 384)
         self.declare_parameter("vqa_num_samples", 1)
         # Feed the ego trajectory history into the VQA prompt too.
         self.declare_parameter("vqa_use_trajectory_input", True)
@@ -137,6 +158,18 @@ class TeleAlpaNode(Node):
         )
         self._answer_stamped_pub = self.create_publisher(
             StringStamped, self.get_parameter("answer_stamped_topic").value, qs
+        )
+        # Latched echo of the question the node is actually using — lets
+        # `ros2 topic echo <question_topic>/active` confirm that a runtime
+        # question published on `question_topic` was received.
+        self._active_question_pub = self.create_publisher(
+            String,
+            f"{self.get_parameter('question_topic').value}/active",
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
         )
         self.get_logger().info(
             f"Publishing trajectory on {traj_topic}, answers on "
@@ -225,6 +258,7 @@ class TeleAlpaNode(Node):
         self.create_subscription(
             String, self.get_parameter("question_topic").value, self._question_callback, qs
         )
+        self._publish_active_question()
 
         # --- model: loaded ONCE, shared by both paths ---
         self.get_logger().info(
@@ -306,6 +340,12 @@ class TeleAlpaNode(Node):
             self.get_logger().info(f"New question: {question!r}")
         self._question = question
         self._last_answered_question = None  # force a fresh answer
+        self._publish_active_question()
+
+    def _publish_active_question(self) -> None:
+        m = String()
+        m.data = self._question
+        self._active_question_pub.publish(m)
 
     def _route_callback(self, msg: LaneletRoute) -> None:
         self._route_lanelet_ids = [seg.preferred_primitive.id for seg in msg.segments]
@@ -444,6 +484,15 @@ class TeleAlpaNode(Node):
 
     def _traj_timer_callback(self) -> None:
         if self._active_future and not self._active_future.done():
+            return
+        # Yield the shared GPU worker to an unanswered question. Both timers gate
+        # on `_active_future`, and this one is registered first and fires more
+        # often, so without this it wins every race and VQA never runs.
+        if (
+            self._vqa_enabled
+            and self._question
+            and self._question != self._last_answered_question
+        ):
             return
         if self._require_new_data and self._rx_count == self._last_traj_rx:
             return
@@ -647,7 +696,17 @@ class TeleAlpaNode(Node):
                 max_generation_length=self._vqa_max_gen_len,
             )
 
-        answer = self._pick_answer(extra)
+        answer, answer_ok = self._pick_answer(extra)
+        if not answer_ok:
+            # The model never closed `<|answer_end|>` within the token budget, so
+            # the parsed span is empty. Publish a visible diagnostic rather than a
+            # silent empty string, and tell the user which knob to turn.
+            answer = (
+                f"[no answer: model did not emit <|answer_end|> within "
+                f"{self._vqa_max_gen_len} tokens — raise vqa_max_generation_length]"
+            )
+            self.get_logger().warning(answer)
+
         now = self.get_clock().now().to_msg()
         m = String()
         m.data = answer
@@ -661,12 +720,18 @@ class TeleAlpaNode(Node):
             "kind": "vqa",
             "duration_sec": time.time() - start,
             "question": question,
-            "answer": answer,
+            "answer": answer if answer_ok else "",
             "with_traj": with_traj,
         }
 
     @staticmethod
-    def _pick_answer(extra: dict) -> str:
+    def _pick_answer(extra: dict) -> tuple[str, bool]:
+        """First non-empty text span from the generate_text output.
+
+        Returns ``(text, ok)``; ``ok`` is False when every field was empty
+        (usually a missing ``<|answer_end|>``), so callers can distinguish
+        "model said nothing" from a genuine short answer.
+        """
         for key in ("answer", "meta_action", "cot"):
             if key not in extra:
                 continue
@@ -675,8 +740,8 @@ class TeleAlpaNode(Node):
             except Exception:
                 continue
             if value:
-                return value
-        return ""
+                return value, True
+        return "", False
 
     # ------------------------------------------------------------------ #
     # Output helpers + completion                                       #

@@ -22,7 +22,7 @@ def generate_launch_description() -> LaunchDescription:
     args = [
         DeclareLaunchArgument(
             "question",
-            default_value="What should the ego vehicle do next, and why?",
+            default_value="Describe the scene.",
             description="Question the node answers about the live scene.",
         ),
         DeclareLaunchArgument("vqa_enabled", default_value="true"),
@@ -55,7 +55,7 @@ def generate_launch_description() -> LaunchDescription:
                 "inference_period_sec": LaunchConfiguration("inference_period_sec"),
                 "require_new_data": LaunchConfiguration("require_new_data"),
                 "use_greedy_decode": True,
-                "vqa_max_generation_length": 256,
+                "vqa_max_generation_length": 384,
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
             }
         ],

@@ -137,7 +137,7 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 | `answer_topic` / `answer_stamped_topic` | `/tele_alpa/answer` / `_stamped` | Answer outputs (`String` / `StringStamped`) |
 | `answer_once` | `false` | Answer once per question change instead of every `vqa_period_sec` |
 | `vqa_use_trajectory_input` | `true` | Fuse ego trajectory-history tokens into the VQA prompt (same input the planner uses) |
-| `vqa_max_generation_length` | `256` | Token budget for the answer |
+| `vqa_max_generation_length` | `384` | Token budget for the answer (too small → empty answer) |
 | `vqa_num_samples` | `1` | Answer samples per VQA run |
 
 Sampling (`use_greedy_decode` / `top_p` / `temperature`) is shared by both paths.
@@ -161,10 +161,32 @@ ros2 launch tele_alpa alpamayo.launch.py \
   num_diffusion_steps:=5 use_greedy_decode:=true
 ```
 
+## Reasoning vs. VQA
+
+Both are text from the same model over the same camera frames, but they are
+produced by different prompts and different decode paths:
+
+| | Reasoning (chain-of-thought) | VQA |
+|---|---|---|
+| Prompt | `helper.create_message` — seeds `<|cot_start|>`, asks for "the chain-of-thought reasoning of the driving process, then the future trajectory" | `helper.create_vqa_message` — wraps your text in `<|question_start|>..<|question_end|>`, seeds `<|answer_start|>` |
+| Decode | `model.sample_trajectories_*` — VLM rollout **+** diffusion over `<i..>` trajectory tokens | `model.generate_text` — plain autoregressive decode, no diffusion, no trajectory tokens |
+| Output | an Autoware `Trajectory` (+ markers); the text is a by-product returned as `extra["cot"]` / `extra["meta_action"]` | text only, returned as `extra["answer"]` |
+| Answers your question? | **No** — the planning prompt is fixed; CoT explains *why this trajectory* | **Yes** |
+| Topic | `cot_topic` (`/alpamayo/reasoning`) | `answer_topic` (`/tele_alpa/answer`) |
+
+Shared: the 10B model, the 4-camera × 4-frame image stack, and the optional
+fused `<|traj_history|>` ego-motion tokens.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError: No module named 'rclpy._rclpy_pybind11'`** — recreate the venv with Python 3.10.
-- **Empty VQA answer** — the model did not emit `<|answer_end|>` within the token budget; increase `max_generation_length`.
+- **VQA never answers, only the trajectory runs** — both timers share one GPU
+  worker; the node now lets an unanswered question preempt the trajectory tick.
+  Confirm the question arrived with `ros2 topic echo /tele_alpa/question/active`,
+  and look for `Running VQA for question:` in the node log.
+- **Empty VQA answer** — the model did not emit `<|answer_end|>` within the token
+  budget. The node now publishes an explicit `[no answer: ...]` string instead of
+  an empty one; raise `vqa_max_generation_length` (default 384).
 - **CUDA OOM** — use a GPU with 24 GB+ VRAM, or increase `inference_period_sec`.
 - **Flash Attention issues** — set `config.attn_implementation = "sdpa"` as a fallback.
 
