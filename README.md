@@ -48,65 +48,108 @@ Camera × 4 (CompressedImage)   Odometry            Question (std_msgs/String)
         /alpamayo/nav_text)   +   /tele_alpa/answer (+ _stamped)
 ```
 
-## Operator assist — stop → describe → propose → approve
+## Stop report — why we stopped + scene + suggested trajectory
 
 When the ego's longitudinal velocity goes **non-positive** (`twist.twist.linear.x
 <= stopped_speed_threshold`, default 0.1 m/s) and stays there for
-`stopped_duration_sec` (default 5 s), the node runs one assist pass:
+`stopped_duration_sec` (default 5 s, so ordinary light stops don't fire), the
+node runs one report pass:
 
-1. **Describe** — VQA with `assist_question` → what is blocking the path.
-2. **Propose** — a nav-conditioned trajectory (`assist_nav_text`, default *"The
+1. **Describe** — VQA with `stop_question` → a brief description of what is
+   blocking the path.
+2. **Suggest** — a nav-conditioned trajectory (`stop_nav_text`, default *"The
    lane ahead is blocked. Plan a path around the obstacle."*) → a way around.
-3. **Ping** — a JSON message to the operator on `/tele_alpa/operator/ping`
-   (latched, so a tool that attaches late still sees it).
-4. **Approve** — the proposal is published on
-   `/tele_alpa/operator/proposed_trajectory` only. It reaches
-   `/tele_alpa/operator/approved_trajectory` **only after** the operator approves.
+3. **Offer a menu** — the last `trajectory_history_size` (default 10) routine
+   trajectories planned **while the ego was still rolling**, so the choice isn't
+   limited to the one fresh suggestion.
+4. **Publish** — a JSON report on `/tele_alpa/stop_report`, the fresh path on
+   `/tele_alpa/stop_trajectory`, and the menu on `/tele_alpa/stop_candidates`
+   (report + paths latched, so a late subscriber still sees the most recent).
 
-The assist pass preempts the routine trajectory and VQA ticks (they share one GPU
-worker). It's all plain ROS topics — wiring `approved_trajectory` into Autoware's
-planning/control mux is deliberately left out.
+> The history buffer is **snapshotted the instant the ego drops below the speed
+> threshold**, not when the report fires. Routine planning keeps running while
+> stopped (`require_new_data` still sees new camera frames), so without the
+> snapshot most of the ring buffer would be post-stop paths on a stationary
+> scene — useless as a menu.
+
+The report pass preempts the routine trajectory and VQA ticks — they share one
+GPU worker. Nothing is gated on a human.
 
 ### Topics
 
-| Topic | Type | Direction |
+| Topic | Type | |
 |---|---|---|
-| `/tele_alpa/operator/ping` | `std_msgs/String` (JSON, latched) | out — the operator request |
-| `/tele_alpa/operator/ping_stamped` | `StringStamped` | out |
-| `/tele_alpa/operator/status` | `std_msgs/String` (JSON, latched) | out — state machine |
-| `/tele_alpa/operator/proposed_trajectory` | `autoware_planning_msgs/Trajectory` (latched) | out — **suggestion only** |
-| `/tele_alpa/operator/proposed_trajectory_markers` | `MarkerArray` (latched) | out — orange path + caption for RViz |
-| `/tele_alpa/operator/approval` | `std_msgs/String` | **in** — `approve[:<id>]` / `reject[:<id>]` |
-| `/tele_alpa/operator/approved_trajectory` | `autoware_planning_msgs/Trajectory` | out — published on approval |
+| `/tele_alpa/stop_report` | `std_msgs/String` (JSON, latched) | out |
+| `/tele_alpa/stop_report_stamped` | `StringStamped` | out |
+| `/tele_alpa/stop_trajectory` | `autoware_planning_msgs/Trajectory` (latched) | out — **suggestion** |
+| `/tele_alpa/stop_trajectory_markers` | `MarkerArray` (latched) | out — orange path + caption |
+| `/tele_alpa/stop_candidates` | `autoware_planning_msgs/Trajectory` ×N | out — pre-stop menu, original stamps preserved |
+| `/tele_alpa/stop_candidates_markers` | `MarkerArray` (latched) | out — the N paths, faded oldest→newest, captioned `#i  <len>m @ <speed>m/s` |
 
-State machine: `IDLE → STOPPED → ASSESSING → AWAITING_OPERATOR → APPROVED / REJECTED / EXPIRED`,
-returning to `IDLE` as soon as the ego moves again.
+State machine: `IDLE → STOPPED → ASSESSING → REPORTED`, back to `IDLE` as soon as
+the ego moves again. While the ego stays stopped, `stop_report_cooldown_sec`
+(default 30 s) throttles repeat reports; a big value means one report per stop.
+
+### Report payload
+
+```json
+{
+  "id": "1a2b3c4d",
+  "seq": 1,
+  "event": "ego_stopped",
+  "stamp_sec": 1789041257.95,
+  "why_stopped": "ego velocity 0.00 m/s <= 0.1 m/s for 5.2s",
+  "scene_description": "A delivery van is stopped in our lane with hazard lights on...",
+  "description_source": "answer",
+  "planner_reasoning": "Nudge left to clear the stopped van blocking our lane",
+  "trajectory": {
+    "available": true,
+    "topic": "/tele_alpa/stop_trajectory",
+    "num_points": 64,
+    "length_m": 21.4,
+    "frame_id": "base_link",
+    "nav_text": "The lane ahead is blocked. Plan a path around the obstacle."
+  },
+  "candidates": {
+    "topic": "/tele_alpa/stop_candidates",
+    "count": 10,
+    "note": "routine trajectories planned before the ego came to rest, newest first; match to recorded Trajectory messages by stamp_sec",
+    "items": [
+      { "index": 0, "stamp_sec": 1789041249.9, "age_sec": 8.05, "ego_speed_mps": 0.4,
+        "num_points": 64, "length_m": 3.2, "nav_text": "Continue straight",
+        "reasoning": "Slow for the stopped vehicle ahead" },
+      { "index": 1, "stamp_sec": 1789041248.9, "age_sec": 9.05, "ego_speed_mps": 1.6,
+        "num_points": 64, "length_m": 9.8, "nav_text": "Continue straight",
+        "reasoning": "Decelerate, lead vehicle is not moving" }
+    ]
+  }
+}
+```
+
+`candidates.items` is **newest first** (index 0 = the last path planned before
+coming to rest). Each entry's `stamp_sec` is the original header stamp of the
+corresponding message republished on `/tele_alpa/stop_candidates`, so an offline
+consumer joins the two by stamp.
+
+`why_stopped` is the mechanical trigger; `scene_description` is the model's
+brief answer to `stop_question`; `planner_reasoning` is the CoT that accompanied
+the suggested path. If no ego history is buffered yet the report still goes out
+with `trajectory.available: false`.
 
 ### Using it
 
 ```bash
-# watch for a request
-ros2 topic echo /tele_alpa/operator/ping
-ros2 topic echo /tele_alpa/operator/status
+ros2 topic echo /tele_alpa/stop_report
+ros2 topic echo /tele_alpa/stop_trajectory
 
-# the ping's JSON carries a copy-paste approve/reject command, e.g.
-ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'approve:1a2b3c4d'}"
-ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'reject:1a2b3c4d'}"
-
-# bare 'approve' / 'reject' (no id) act on the outstanding proposal
-ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'approve'}"
-
-# then
-ros2 topic echo /tele_alpa/operator/approved_trajectory
+# for an offline run, record and analyse later
+ros2 bag record /tele_alpa/stop_report_stamped /tele_alpa/stop_trajectory \
+  /tele_alpa/stop_candidates \
+  /alpamayo/predicted_trajectory /alpamayo/reasoning /localization/kinematic_state
 ```
 
-A proposal that gets no answer within `proposal_ttl_sec` (default 120 s) EXPIREs.
-After an approve / reject / expiry the node waits `assist_cooldown_sec`
-(default 30 s) before proposing again while the ego is still stopped.
-
-> The proposed path is **not** collision-checked, drivable-area-checked, or
-> feasibility-checked. Validate it before anything acts on it — operator approval
-> must not be the only safety gate.
+> The suggested path is **not** collision-checked, drivable-area-checked, or
+> feasibility-checked. It is an experiment output, not a control input.
 
 ### Other executables (optional)
 
@@ -207,20 +250,19 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 | `vqa_max_generation_length` | `384` | Token budget for the answer (too small → empty answer) |
 | `vqa_num_samples` | `1` | Answer samples per VQA run |
 
-Operator assist:
+Stop report:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `operator_assist_enabled` | `true` | Run the stop → describe → propose → approve flow |
+| `stop_report_enabled` | `true` | Run the stop → describe → suggest flow |
 | `stopped_speed_threshold` | `0.1` | m/s; `linear.x` at or below this counts as stopped |
-| `stopped_duration_sec` | `5.0` | Debounce, so ordinary traffic-light stops don't ping |
-| `assist_check_period_sec` | `0.5` | How often the stop condition / TTL is evaluated |
-| `proposal_ttl_sec` | `120.0` | Approval window before the proposal EXPIREs |
-| `assist_cooldown_sec` | `30.0` | Wait after approve/reject/expiry before re-proposing |
-| `assist_question` | *"…describe what is blocking the path ahead…"* | VQA prompt for the description |
-| `assist_nav_text` | *"The lane ahead is blocked. Plan a path around the obstacle."* | Route hint for the proposed path; empty → reuse the lanelet2 nav text |
-| `operator_ping_topic` / `operator_ping_stamped_topic` / `operator_status_topic` | `/tele_alpa/operator/…` | Outputs |
-| `proposed_trajectory_topic` / `approval_topic` / `approved_trajectory_topic` | `/tele_alpa/operator/…` | Proposal, operator input, approved output |
+| `stopped_duration_sec` | `5.0` | Debounce, so ordinary traffic-light stops don't fire |
+| `stop_check_period_sec` | `0.5` | How often the stop condition is evaluated |
+| `stop_report_cooldown_sec` | `30.0` | Throttle on repeat reports while still stopped |
+| `stop_question` | *"…describe what is blocking the path ahead…"* | VQA prompt for the description |
+| `stop_nav_text` | *"The lane ahead is blocked. Plan a path around the obstacle."* | Route hint for the suggested path; empty → reuse the lanelet2 nav text |
+| `trajectory_history_size` | `10` | Rolling buffer of routine trajectories kept as the pre-stop menu |
+| `stop_report_topic` / `stop_report_stamped_topic` / `stop_trajectory_topic` / `stop_candidates_topic` | `/tele_alpa/…` | Outputs |
 
 Sampling (`use_greedy_decode` / `top_p` / `temperature`) is shared by both paths.
 

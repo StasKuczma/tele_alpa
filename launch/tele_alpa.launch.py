@@ -9,8 +9,9 @@ def generate_launch_description() -> LaunchDescription:
     chain-of-thought reasoning + navigation text + scene VQA.
 
     The model is loaded once; the trajectory and VQA inferences share a
-    single-worker executor so they never run on the GPU at the same time, and an
-    unanswered question preempts the trajectory tick.
+    single-worker executor so they never run on the GPU at the same time. When the
+    ego stops, a stop report (why + scene description + suggested trajectory) is
+    published and preempts the routine ticks.
 
         ros2 launch tele_alpa tele_alpa.launch.py question:="Is it safe to merge left?"
     """
@@ -34,12 +35,12 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("lanelet2_map_path", default_value=""),
         DeclareLaunchArgument("require_new_data", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
-        # --- operator assist ---
-        DeclareLaunchArgument("operator_assist_enabled", default_value="true"),
+        # --- stop report ---
+        DeclareLaunchArgument("stop_report_enabled", default_value="true"),
         DeclareLaunchArgument("stopped_speed_threshold", default_value="0.1"),
         DeclareLaunchArgument("stopped_duration_sec", default_value="5.0"),
-        DeclareLaunchArgument("proposal_ttl_sec", default_value="120.0"),
-        DeclareLaunchArgument("assist_cooldown_sec", default_value="30.0"),
+        DeclareLaunchArgument("stop_report_cooldown_sec", default_value="30.0"),
+        DeclareLaunchArgument("trajectory_history_size", default_value="10"),
     ]
 
     node = Node(
@@ -75,18 +76,16 @@ def generate_launch_description() -> LaunchDescription:
                 "use_greedy_decode": True,
                 "require_new_data": LaunchConfiguration("require_new_data"),
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
-                # operator assist: ego stops -> describe + propose -> approve
-                "operator_assist_enabled": LaunchConfiguration("operator_assist_enabled"),
+                # stop report: ego stops -> why + scene description + trajectory
+                "stop_report_enabled": LaunchConfiguration("stop_report_enabled"),
                 "stopped_speed_threshold": LaunchConfiguration("stopped_speed_threshold"),
                 "stopped_duration_sec": LaunchConfiguration("stopped_duration_sec"),
-                "proposal_ttl_sec": LaunchConfiguration("proposal_ttl_sec"),
-                "assist_cooldown_sec": LaunchConfiguration("assist_cooldown_sec"),
-                "operator_ping_topic": "/tele_alpa/operator/ping",
-                "operator_ping_stamped_topic": "/tele_alpa/operator/ping_stamped",
-                "operator_status_topic": "/tele_alpa/operator/status",
-                "proposed_trajectory_topic": "/tele_alpa/operator/proposed_trajectory",
-                "approval_topic": "/tele_alpa/operator/approval",
-                "approved_trajectory_topic": "/tele_alpa/operator/approved_trajectory",
+                "stop_report_cooldown_sec": LaunchConfiguration("stop_report_cooldown_sec"),
+                "stop_report_topic": "/tele_alpa/stop_report",
+                "stop_report_stamped_topic": "/tele_alpa/stop_report_stamped",
+                "stop_trajectory_topic": "/tele_alpa/stop_trajectory",
+                "trajectory_history_size": LaunchConfiguration("trajectory_history_size"),
+                "stop_candidates_topic": "/tele_alpa/stop_candidates",
             }
         ],
     )

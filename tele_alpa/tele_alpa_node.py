@@ -10,12 +10,12 @@ Outputs
 * an Autoware ``Trajectory`` (+ RViz markers),
 * the planner's chain-of-thought "reasoning" and derived navigation text,
 * a free-form answer to a question about the live scene (VQA),
-* an **operator assist** request: when the ego's velocity goes non-positive for
-  ``stopped_duration_sec``, the model describes what is blocking the path and
-  drafts a way around it, pings a human on ``operator_ping_topic``, and only
-  republishes that path on ``approved_trajectory_topic`` once the operator
-  approves on ``approval_topic``. Plain ROS topics — no execution mux, and the
-  proposal is *not* collision- or feasibility-checked.
+* a **stop report**: when the ego's velocity goes non-positive for
+  ``stopped_duration_sec``, the model writes a brief description of why the
+  vehicle stopped and drafts a trajectory around the obstacle. The report goes
+  to ``stop_report_topic`` (JSON) and the path to ``stop_trajectory_topic``.
+  Plain ROS topics, nothing gated on a human — the path is a *suggestion* and is
+  not collision- or feasibility-checked.
 
 The 10B model is loaded **once**. The trajectory path and the VQA path submit to
 the same single-worker executor, so they never touch the GPU at the same time,
@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 import uuid
 from collections import deque
@@ -84,22 +85,21 @@ DEFAULT_VQA_SYSTEM_PROMPT = (
     "question about the scene directly, concisely, and factually."
 )
 
-# --- operator assist ------------------------------------------------------- #
-DEFAULT_ASSIST_QUESTION = (
+# --- stop report ----------------------------------------------------------- #
+DEFAULT_STOP_QUESTION = (
     "The ego vehicle has come to a stop. In one or two sentences, describe what "
     "is blocking the path ahead and why the vehicle cannot proceed. Answer in "
     "words, not coordinates."
 )
-DEFAULT_ASSIST_NAV_TEXT = "The lane ahead is blocked. Plan a path around the obstacle."
+DEFAULT_STOP_NAV_TEXT = "The lane ahead is blocked. Plan a path around the obstacle."
 
-# Assist state machine. IDLE while the ego is moving; the rest is one stop event.
-ASSIST_IDLE = "IDLE"
-ASSIST_STOPPED = "STOPPED"  # below speed threshold, waiting out stopped_duration_sec
-ASSIST_ASSESSING = "ASSESSING"  # model is describing the scene + drafting a path
-ASSIST_AWAITING = "AWAITING_OPERATOR"  # proposal published, waiting for approve/reject
-ASSIST_APPROVED = "APPROVED"
-ASSIST_REJECTED = "REJECTED"
-ASSIST_EXPIRED = "EXPIRED"
+# Stop-report state machine. IDLE while the ego is moving; the rest is one stop
+# event. REPORTED holds until the ego moves again or the cooldown lets a fresh
+# report go out on a scene that has changed.
+STOP_IDLE = "IDLE"
+STOP_STOPPED = "STOPPED"  # below speed threshold, waiting out stopped_duration_sec
+STOP_ASSESSING = "ASSESSING"  # model is describing the scene + drafting a path
+STOP_REPORTED = "REPORTED"
 
 # Ego trajectory-history placeholder, identical to the one
 # ``helper.create_message`` builds for planning. ``fuse_traj_tokens`` swaps these
@@ -164,29 +164,30 @@ class TeleAlpaNode(Node):
             ),
         )
 
-        # Operator assist. The ping and the status are latched so an operator
-        # tool that attaches late still sees the outstanding request.
+        # Stop report. Latched so a tool (or a bag replay consumer) that
+        # attaches late still sees the most recent report and path.
         latched = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self._ping_pub = self.create_publisher(
-            String, self._param("operator_ping_topic"), latched
+        self._stop_report_pub = self.create_publisher(
+            String, self._param("stop_report_topic"), latched
         )
-        self._ping_stamped_pub = self.create_publisher(
-            StringStamped, self._param("operator_ping_stamped_topic"), qs
+        self._stop_report_stamped_pub = self.create_publisher(
+            StringStamped, self._param("stop_report_stamped_topic"), qs
         )
-        self._assist_status_pub = self.create_publisher(
-            String, self._param("operator_status_topic"), latched
+        stop_traj_topic = self._param("stop_trajectory_topic")
+        self._stop_traj_pub = self.create_publisher(Trajectory, stop_traj_topic, latched)
+        self._stop_marker_pub = self.create_publisher(
+            MarkerArray, f"{stop_traj_topic}_markers", latched
         )
-        proposed_topic = self._param("proposed_trajectory_topic")
-        self._proposed_traj_pub = self.create_publisher(Trajectory, proposed_topic, latched)
-        self._proposed_marker_pub = self.create_publisher(
-            MarkerArray, f"{proposed_topic}_markers", latched
+        candidates_topic = self._param("stop_candidates_topic")
+        self._candidates_pub = self.create_publisher(
+            Trajectory, candidates_topic, max(qs, int(self._param("trajectory_history_size")))
         )
-        self._approved_traj_pub = self.create_publisher(
-            Trajectory, self._param("approved_trajectory_topic"), qs
+        self._candidates_marker_pub = self.create_publisher(
+            MarkerArray, f"{candidates_topic}_markers", latched
         )
 
         # ------------------------------------------------------------------ #
@@ -211,19 +212,26 @@ class TeleAlpaNode(Node):
         self._nav_text: Optional[str] = None
         self._warned_no_odom = False
 
-        # --- operator assist state ---
-        self._assist_enabled = bool(self._param("operator_assist_enabled"))
+        # --- stop-report state ---
+        self._stop_report_enabled = bool(self._param("stop_report_enabled"))
         self._stopped_speed_threshold = float(self._param("stopped_speed_threshold"))
         self._stopped_duration_sec = float(self._param("stopped_duration_sec"))
-        self._proposal_ttl_sec = float(self._param("proposal_ttl_sec"))
-        self._assist_cooldown_sec = float(self._param("assist_cooldown_sec"))
-        self._assist_question = str(self._param("assist_question") or DEFAULT_ASSIST_QUESTION)
-        self._assist_nav_text = str(self._param("assist_nav_text") or "").strip()
+        self._stop_report_cooldown_sec = float(self._param("stop_report_cooldown_sec"))
+        self._stop_question = str(self._param("stop_question") or DEFAULT_STOP_QUESTION)
+        self._stop_nav_text = str(self._param("stop_nav_text") or "").strip()
         self._ego_speed = 0.0
         self._stopped_since: Optional[float] = None
-        self._assist_state = ASSIST_IDLE
-        self._proposal: Optional[Dict[str, Any]] = None
-        self._assist_blocked_until = 0.0
+        self._stop_state = STOP_IDLE
+        self._stop_blocked_until = 0.0
+        self._stop_report_count = 0
+
+        # Rolling history of routine trajectories, appended by the worker thread
+        # and snapshotted from the odometry callback -> guard both with a lock.
+        self._traj_history: deque = deque(
+            maxlen=max(1, int(self._param("trajectory_history_size")))
+        )
+        self._traj_history_lock = threading.Lock()
+        self._pre_stop_candidates: List[Dict[str, Any]] = []
 
         # ------------------------------------------------------------------ #
         # Subscriptions                                                     #
@@ -264,9 +272,6 @@ class TeleAlpaNode(Node):
 
         self.create_subscription(
             String, self._param("question_topic"), self._on_question, qs
-        )
-        self.create_subscription(
-            String, self._param("approval_topic"), self._on_approval, qs
         )
 
         # ------------------------------------------------------------------ #
@@ -329,19 +334,18 @@ class TeleAlpaNode(Node):
             self._vqa_timer = self.create_timer(
                 float(self._param("vqa_period_sec")), self._vqa_timer_callback
             )
-        if self._assist_enabled:
-            self._assist_timer = self.create_timer(
-                float(self._param("assist_check_period_sec")), self._assist_timer_callback
+        if self._stop_report_enabled:
+            self._stop_timer = self.create_timer(
+                float(self._param("stop_check_period_sec")), self._stop_timer_callback
             )
         self._publish_active_question()
-        self._set_assist_state(ASSIST_IDLE)
         self.get_logger().info(
             f"tele_alpa ready — trajectory on {traj_topic}, "
             f"answers on {self._param('answer_topic')}, "
             f"VQA {'enabled' if self._vqa_enabled else 'disabled'}, "
-            f"operator assist {'enabled' if self._assist_enabled else 'disabled'} "
-            f"(stop < {self._stopped_speed_threshold} m/s for "
-            f"{self._stopped_duration_sec}s -> {self._param('operator_ping_topic')}), "
+            f"stop report {'enabled' if self._stop_report_enabled else 'disabled'} "
+            f"(v <= {self._stopped_speed_threshold} m/s for "
+            f"{self._stopped_duration_sec}s -> {self._param('stop_report_topic')}), "
             f"question={self._question!r}"
         )
 
@@ -397,38 +401,35 @@ class TeleAlpaNode(Node):
         # empty string keeps that upstream default.
         self.declare_parameter("vqa_system_prompt", DEFAULT_VQA_SYSTEM_PROMPT)
 
-        # --- operator assist ---
+        # --- stop report ---
         # When the ego stops (non-positive velocity) for `stopped_duration_sec`,
-        # ask the model what is blocking the path, draft a way around it, and
-        # ping a human operator who must approve before the path is re-published
-        # on `approved_trajectory_topic`. Everything is plain ROS topics.
-        self.declare_parameter("operator_assist_enabled", True)
+        # ask the model why it stopped / what is blocking the path and draft a
+        # trajectory around the obstacle. Report + path go out on topics; nothing
+        # is gated on a human.
+        self.declare_parameter("stop_report_enabled", True)
         # "not positive" velocity, with a small deadband for sensor noise (m/s).
         self.declare_parameter("stopped_speed_threshold", 0.1)
-        # Debounce, so ordinary traffic-light stops do not ping the operator.
+        # Debounce, so ordinary traffic-light stops do not fire a report.
         self.declare_parameter("stopped_duration_sec", 5.0)
-        self.declare_parameter("assist_check_period_sec", 0.5)
-        # How long a proposal stays approvable before it EXPIREs.
-        self.declare_parameter("proposal_ttl_sec", 120.0)
-        # After a reject / expiry, wait this long before proposing again while
-        # the ego is still stopped.
-        self.declare_parameter("assist_cooldown_sec", 30.0)
-        self.declare_parameter("assist_question", DEFAULT_ASSIST_QUESTION)
-        # Route hint used for the proposed trajectory. Empty -> reuse the current
+        self.declare_parameter("stop_check_period_sec", 0.5)
+        # While the ego stays stopped, wait this long before reporting again.
+        # 0 -> report once per stop event.
+        self.declare_parameter("stop_report_cooldown_sec", 30.0)
+        self.declare_parameter("stop_question", DEFAULT_STOP_QUESTION)
+        # Route hint for the suggested trajectory. Empty -> reuse the current
         # lanelet2-derived nav text.
-        self.declare_parameter("assist_nav_text", DEFAULT_ASSIST_NAV_TEXT)
-        self.declare_parameter("operator_ping_topic", "/tele_alpa/operator/ping")
+        self.declare_parameter("stop_nav_text", DEFAULT_STOP_NAV_TEXT)
+        self.declare_parameter("stop_report_topic", "/tele_alpa/stop_report")
         self.declare_parameter(
-            "operator_ping_stamped_topic", "/tele_alpa/operator/ping_stamped"
+            "stop_report_stamped_topic", "/tele_alpa/stop_report_stamped"
         )
-        self.declare_parameter("operator_status_topic", "/tele_alpa/operator/status")
-        self.declare_parameter(
-            "proposed_trajectory_topic", "/tele_alpa/operator/proposed_trajectory"
-        )
-        self.declare_parameter("approval_topic", "/tele_alpa/operator/approval")
-        self.declare_parameter(
-            "approved_trajectory_topic", "/tele_alpa/operator/approved_trajectory"
-        )
+        self.declare_parameter("stop_trajectory_topic", "/tele_alpa/stop_trajectory")
+        # Rolling buffer of routine trajectories. The buffer is snapshotted the
+        # instant the ego drops below the speed threshold, so the report carries
+        # the last N paths planned *while still moving* — a menu to choose from
+        # alongside the freshly drafted way around.
+        self.declare_parameter("trajectory_history_size", 10)
+        self.declare_parameter("stop_candidates_topic", "/tele_alpa/stop_candidates")
 
     def _param(self, name: str):
         return self.get_parameter(name).value
@@ -461,12 +462,17 @@ class TeleAlpaNode(Node):
     def _on_odometry(self, msg: Odometry) -> None:
         self._odom_buffer.append(msg)
         # Longitudinal speed in base_link. "Not positive" (<= threshold) starts
-        # the stopped clock that arms the operator-assist trigger.
+        # the stopped clock that arms the stop-report trigger.
         self._ego_speed = float(msg.twist.twist.linear.x)
         if self._ego_speed > self._stopped_speed_threshold:
             self._stopped_since = None
         elif self._stopped_since is None:
+            # Just came to rest. Freeze the trajectory history now: routine
+            # planning keeps running while stopped, so waiting until the report
+            # fires would flush the pre-stop paths out of the ring buffer.
             self._stopped_since = time.monotonic()
+            with self._traj_history_lock:
+                self._pre_stop_candidates = list(self._traj_history)
 
     def _on_route(self, msg: LaneletRoute) -> None:
         self._route_lanelet_ids = [seg.preferred_primitive.id for seg in msg.segments]
@@ -582,9 +588,9 @@ class TeleAlpaNode(Node):
     def _traj_timer_callback(self) -> None:
         if self._active_future and not self._active_future.done():
             return
-        # An outstanding operator request outranks routine planning: the ego is
-        # stopped anyway, and re-planning would only fight the pending proposal.
-        if self._assist_pending():
+        # A stop report in flight outranks routine planning — the ego is stopped
+        # anyway, and both want the one GPU worker.
+        if self._stop_report_pending():
             return
         # Yield the shared GPU worker to an unanswered question. Both timers gate
         # on `_active_future`, and this one fires more often, so without this it
@@ -677,6 +683,22 @@ class TeleAlpaNode(Node):
                 StringStamped(stamp=traj_msg.header.stamp, data=reasoning)
             )
 
+        # Keep it for the stop report's candidate menu.
+        entry = {
+            "msg": traj_msg,
+            "points": trajectory,
+            "mono_t": time.monotonic(),
+            "stamp_sec": traj_msg.header.stamp.sec
+            + traj_msg.header.stamp.nanosec * 1e-9,
+            "ego_speed_mps": round(self._ego_speed, 3),
+            "nav_text": nav_text,
+            "reasoning": reasoning,
+            "num_points": len(traj_msg.points),
+            "length_m": round(self._path_length(trajectory), 2),
+        }
+        with self._traj_history_lock:
+            self._traj_history.append(entry)
+
         return {
             "kind": "trajectory",
             "duration_sec": time.time() - start,
@@ -693,7 +715,7 @@ class TeleAlpaNode(Node):
             return
         if self._active_future and not self._active_future.done():
             return
-        if self._assist_pending():
+        if self._stop_report_pending():
             return
         if self._answer_once and self._question == self._last_answered_question:
             return
@@ -835,67 +857,40 @@ class TeleAlpaNode(Node):
         return "", None
 
     # ------------------------------------------------------------------ #
-    # Operator assist                                                   #
+    # Stop report                                                        #
     #                                                                    #
-    # Ego stops (non-positive velocity) -> the model describes what is    #
-    # blocking the path and drafts a way around it -> a ping goes to the  #
-    # operator, who must approve before the path is republished on        #
-    # `approved_trajectory_topic`. Plain ROS topics, no execution mux.    #
+    # Ego velocity goes non-positive -> the model says why it stopped and #
+    # what it sees, and drafts a trajectory around the obstacle. Report + #
+    # path go straight out on topics.                                    #
     # ------------------------------------------------------------------ #
 
-    def _assist_pending(self) -> bool:
-        """True while a stop event is being handled — used to hold off the
-        routine trajectory / VQA ticks so the assist run gets the GPU."""
-        return self._assist_state in (ASSIST_ASSESSING, ASSIST_AWAITING)
+    def _stop_report_pending(self) -> bool:
+        """True while a stop report is being produced — holds off the routine
+        trajectory / VQA ticks so the report run gets the GPU."""
+        return self._stop_state == STOP_ASSESSING
 
-    def _set_assist_state(self, state: str, detail: str = "") -> None:
-        self._assist_state = state
-        payload = {
-            "state": state,
-            "detail": detail,
-            "ego_speed_mps": round(self._ego_speed, 3),
-            "proposal_id": (self._proposal or {}).get("id"),
-        }
-        self._assist_status_pub.publish(String(data=json.dumps(payload)))
-
-    def _assist_timer_callback(self) -> None:
-        if not self._assist_enabled:
+    def _stop_timer_callback(self) -> None:
+        if not self._stop_report_enabled:
             return
         now = time.monotonic()
-        moving = self._ego_speed > self._stopped_speed_threshold
 
-        # Vehicle is rolling again -> the stop event is over, whatever its state.
-        if moving:
-            if self._assist_state != ASSIST_IDLE:
-                self._proposal = None
-                self._set_assist_state(ASSIST_IDLE, "ego moving again")
+        # Rolling again -> the stop event is over, whatever state it was in.
+        if self._ego_speed > self._stopped_speed_threshold:
+            if self._stop_state != STOP_IDLE:
+                self.get_logger().info("stop report: ego moving again")
+                self._stop_state = STOP_IDLE
             return
 
-        if self._assist_state == ASSIST_AWAITING:
-            proposal = self._proposal
-            if proposal and now - proposal["created_at"] > self._proposal_ttl_sec:
-                self.get_logger().warning(
-                    f"proposal {proposal['id']} expired after {self._proposal_ttl_sec:.0f}s "
-                    f"with no operator response"
-                )
-                self._proposal = None
-                self._assist_blocked_until = now + self._assist_cooldown_sec
-                self._set_assist_state(ASSIST_EXPIRED, "no operator response")
-            return
-
-        if self._assist_state == ASSIST_ASSESSING:
+        if self._stop_state == STOP_ASSESSING:
             return  # inference in flight
-
-        # IDLE / APPROVED / REJECTED / EXPIRED and still stopped: re-arm once the
-        # cooldown has passed and the ego has been stopped long enough.
-        if now < self._assist_blocked_until:
-            return
+        if now < self._stop_blocked_until:
+            return  # reported recently; wait out the cooldown
         if self._stopped_since is None:
             return
+
         stopped_for = now - self._stopped_since
         if stopped_for < self._stopped_duration_sec:
-            if self._assist_state == ASSIST_IDLE:
-                self._set_assist_state(ASSIST_STOPPED, f"stopped {stopped_for:.1f}s")
+            self._stop_state = STOP_STOPPED
             return
 
         if self._active_future and not self._active_future.done():
@@ -905,17 +900,17 @@ class TeleAlpaNode(Node):
             return
         ego_xyz, ego_rot, _ = self._build_ego_history()
 
-        self._set_assist_state(ASSIST_ASSESSING, f"stopped {stopped_for:.1f}s")
+        self._stop_state = STOP_ASSESSING
         self.get_logger().info(
-            f"operator assist: ego stopped {stopped_for:.1f}s "
+            f"stop report: ego stopped {stopped_for:.1f}s "
             f"(v={self._ego_speed:.2f} m/s) — assessing scene"
         )
         self._active_future = self._executor.submit(
-            self._run_operator_assist, frames, ego_xyz, ego_rot, stopped_for
+            self._run_stop_report, frames, ego_xyz, ego_rot, stopped_for
         )
         self._active_future.add_done_callback(self._on_future_done)
 
-    def _run_operator_assist(
+    def _run_stop_report(
         self,
         frames: torch.Tensor,
         ego_xyz: Optional[torch.Tensor],
@@ -924,137 +919,153 @@ class TeleAlpaNode(Node):
     ) -> dict:
         start = time.time()
 
-        # 1) Describe the blockage for the operator.
+        # 1) Why did we stop / what is out there.
         description, source = self._infer_answer(
-            self._assist_question, frames, ego_xyz, ego_rot
+            self._stop_question, frames, ego_xyz, ego_rot
         )
 
-        # 2) Draft a way around it. Needs ego history — the planner cannot run
-        #    without it, so fall back to a description-only ping.
-        trajectory = rotation = None
+        # 2) Draft a way around it. The planner needs ego history, so without it
+        #    the report goes out description-only.
+        trajectory = None
         reasoning = ""
         traj_msg: Optional[Trajectory] = None
         if ego_xyz is not None and ego_rot is not None:
-            nav_text = self._assist_nav_text or self._nav_text
+            nav_text = self._stop_nav_text or self._nav_text
             trajectory, rotation, extra = self._infer_trajectory(
                 frames, ego_xyz, ego_rot, nav_text
             )
             reasoning = self._span(extra, "cot")
             traj_msg = self._to_autoware_trajectory(trajectory, rotation)
 
-        proposal_id = uuid.uuid4().hex[:8]
+        # 3) The menu: paths planned while the ego was still rolling, newest
+        #    first, snapshotted the moment it came to rest.
+        candidates = list(reversed(self._pre_stop_candidates))
+        now_mono = time.monotonic()
+
+        self._stop_report_count += 1
+        report_id = uuid.uuid4().hex[:8]
         stamp = self.get_clock().now().to_msg()
-        approval_topic = self._param("approval_topic")
-        ping = {
-            "id": proposal_id,
+        report = {
+            "id": report_id,
+            "seq": self._stop_report_count,
             "event": "ego_stopped",
-            "reason": (
-                f"ego stopped for {stopped_for:.1f}s "
-                f"(v={self._ego_speed:.2f} m/s <= {self._stopped_speed_threshold} m/s)"
+            "stamp_sec": stamp.sec + stamp.nanosec * 1e-9,
+            "why_stopped": (
+                f"ego velocity {self._ego_speed:.2f} m/s <= "
+                f"{self._stopped_speed_threshold} m/s for {stopped_for:.1f}s"
             ),
-            "description": description,
+            "scene_description": description,
             "description_source": source or "none",
             "planner_reasoning": reasoning,
-            "proposal": {
+            "trajectory": {
                 "available": traj_msg is not None,
-                "topic": self._param("proposed_trajectory_topic"),
+                "topic": self._param("stop_trajectory_topic"),
                 "num_points": len(traj_msg.points) if traj_msg else 0,
                 "length_m": round(self._path_length(trajectory), 2) if traj_msg else 0.0,
                 "frame_id": self._frame_id,
+                "nav_text": (self._stop_nav_text or self._nav_text) if traj_msg else None,
             },
-            "ttl_sec": self._proposal_ttl_sec,
-            "approve": (
-                f"ros2 topic pub --once {approval_topic} std_msgs/String "
-                f"\"{{data: 'approve:{proposal_id}'}}\""
-            ),
-            "reject": (
-                f"ros2 topic pub --once {approval_topic} std_msgs/String "
-                f"\"{{data: 'reject:{proposal_id}'}}\""
-            ),
+            "candidates": {
+                "topic": self._param("stop_candidates_topic"),
+                "count": len(candidates),
+                "note": (
+                    "routine trajectories planned before the ego came to rest, "
+                    "newest first; match to recorded Trajectory messages by stamp_sec"
+                ),
+                "items": [
+                    {
+                        "index": i,
+                        "stamp_sec": round(c["stamp_sec"], 3),
+                        "age_sec": round(now_mono - c["mono_t"], 2),
+                        "ego_speed_mps": c["ego_speed_mps"],
+                        "num_points": c["num_points"],
+                        "length_m": c["length_m"],
+                        "nav_text": c["nav_text"],
+                        "reasoning": c["reasoning"],
+                    }
+                    for i, c in enumerate(candidates)
+                ],
+            },
         }
-        ping_json = json.dumps(ping, indent=2)
+        report_json = json.dumps(report, indent=2)
 
         if traj_msg is not None:
-            self._proposed_traj_pub.publish(traj_msg)
-            self._proposed_marker_pub.publish(
+            self._stop_traj_pub.publish(traj_msg)
+            self._stop_marker_pub.publish(
                 self._trajectory_markers(
                     trajectory,
-                    ns="operator_proposal",
+                    ns="stop_report",
                     color=ColorRGBA(r=1.0, g=0.55, b=0.0, a=1.0),
-                    label=f"PROPOSAL {proposal_id}: {description[:80]}",
+                    label=f"STOP {report_id}: {description[:80]}",
                 )
             )
+        if candidates:
+            # Republish each candidate keeping its ORIGINAL header stamp, so an
+            # offline consumer can join them to the report's `items[].stamp_sec`.
+            for c in candidates:
+                self._candidates_pub.publish(c["msg"])
+            self._candidates_marker_pub.publish(self._candidate_markers(candidates))
 
-        self._proposal = {
-            "id": proposal_id,
-            "created_at": time.monotonic(),
-            "trajectory": traj_msg,
-            "description": description,
-            "reasoning": reasoning,
-        }
-        self._ping_pub.publish(String(data=ping_json))
-        self._ping_stamped_pub.publish(StringStamped(stamp=stamp, data=ping_json))
-        self._set_assist_state(ASSIST_AWAITING, f"proposal {proposal_id} awaiting approval")
+        self._stop_report_pub.publish(String(data=report_json))
+        self._stop_report_stamped_pub.publish(StringStamped(stamp=stamp, data=report_json))
+
+        self._stop_state = STOP_REPORTED
+        self._stop_blocked_until = time.monotonic() + self._stop_report_cooldown_sec
 
         return {
-            "kind": "assist",
+            "kind": "stop_report",
             "duration_sec": time.time() - start,
-            "proposal_id": proposal_id,
+            "report_id": report_id,
             "description": description,
+            "reasoning": reasoning,
             "has_trajectory": traj_msg is not None,
-            "approve_cmd": ping["approve"],
+            "num_points": len(traj_msg.points) if traj_msg else 0,
+            "num_candidates": len(candidates),
         }
 
-    def _on_approval(self, msg: String) -> None:
-        raw = msg.data.strip().lower()
-        if not raw:
-            return
-        verb, _, target = raw.partition(":")
-        verb = verb.strip()
-        target = target.strip()
-        if verb not in ("approve", "reject"):
-            self.get_logger().warning(
-                f"approval message {msg.data!r} not understood — "
-                f"expected 'approve[:<id>]' or 'reject[:<id>]'"
+    def _candidate_markers(self, candidates: List[Dict[str, Any]]) -> MarkerArray:
+        """One line strip per pre-stop candidate, faded oldest -> newest, each
+        captioned with its index so a choice can be made straight from RViz."""
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        n = max(1, len(candidates))
+        for i, c in enumerate(candidates):
+            # index 0 is the newest -> brightest / most opaque.
+            fade = 1.0 - (i / n) * 0.75
+            color = ColorRGBA(r=0.1, g=0.6 * fade + 0.2, b=1.0 * fade, a=fade)
+            points = c["points"].numpy()
+
+            line = Marker()
+            line.header.stamp = stamp
+            line.header.frame_id = self._frame_id
+            line.ns = "stop_candidates"
+            line.id = i
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.scale.x = 0.6
+            line.color = color
+            line.pose.orientation.w = 1.0
+            for p in points:
+                line.points.append(Point(x=float(p[0]), y=float(p[1]), z=float(p[2])))
+            markers.markers.append(line)
+
+            text = Marker()
+            text.header.stamp = stamp
+            text.header.frame_id = self._frame_id
+            text.ns = "stop_candidates_label"
+            text.id = i
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.scale.z = 1.0
+            text.color = color
+            tip = points[-1]
+            text.pose.position = Point(
+                x=float(tip[0]), y=float(tip[1]), z=float(tip[2]) + 1.5
             )
-            return
-
-        proposal = self._proposal
-        if proposal is None or self._assist_state != ASSIST_AWAITING:
-            self.get_logger().warning(f"'{verb}' received but no proposal is awaiting approval")
-            return
-        if target and target not in ("latest", proposal["id"]):
-            self.get_logger().warning(
-                f"'{verb}:{target}' does not match the outstanding proposal "
-                f"{proposal['id']} — ignoring"
-            )
-            return
-
-        if verb == "reject":
-            self.get_logger().info(f"operator REJECTED proposal {proposal['id']}")
-            self._proposal = None
-            self._assist_blocked_until = time.monotonic() + self._assist_cooldown_sec
-            self._set_assist_state(ASSIST_REJECTED, f"proposal {proposal['id']} rejected")
-            return
-
-        traj_msg = proposal["trajectory"]
-        if traj_msg is None:
-            self.get_logger().warning(
-                f"proposal {proposal['id']} has no trajectory to approve (description only)"
-            )
-            self._proposal = None
-            self._assist_blocked_until = time.monotonic() + self._assist_cooldown_sec
-            self._set_assist_state(ASSIST_REJECTED, "no trajectory in proposal")
-            return
-
-        traj_msg.header.stamp = self.get_clock().now().to_msg()
-        self._approved_traj_pub.publish(traj_msg)
-        self.get_logger().info(
-            f"operator APPROVED proposal {proposal['id']} — republished "
-            f"{len(traj_msg.points)} points on {self._param('approved_trajectory_topic')}"
-        )
-        self._assist_blocked_until = time.monotonic() + self._assist_cooldown_sec
-        self._set_assist_state(ASSIST_APPROVED, f"proposal {proposal['id']} approved")
+            text.pose.orientation.w = 1.0
+            text.text = f"#{i}  {c['length_m']:.1f}m @ {c['ego_speed_mps']:.1f}m/s"
+            markers.markers.append(text)
+        return markers
 
     @staticmethod
     def _path_length(trajectory: Optional[torch.Tensor]) -> float:
@@ -1063,7 +1074,6 @@ class TeleAlpaNode(Node):
         pts = trajectory.numpy()[:, :2]
         return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
 
-    # ------------------------------------------------------------------ #
     # Completion + output builders                                      #
     # ------------------------------------------------------------------ #
 
@@ -1072,12 +1082,13 @@ class TeleAlpaNode(Node):
             metrics = future.result()
         except Exception as exc:  # noqa: BLE001 — surface any inference failure
             self.get_logger().error(f"inference failed: {exc}")
-            # A failed assist run would otherwise leave the node stuck in
+            # A failed stop-report run would otherwise leave the node stuck in
             # ASSESSING, which also holds off the trajectory and VQA ticks.
-            if self._assist_state == ASSIST_ASSESSING:
-                self._proposal = None
-                self._assist_blocked_until = time.monotonic() + self._assist_cooldown_sec
-                self._set_assist_state(ASSIST_IDLE, f"assist run failed: {exc}")
+            if self._stop_state == STOP_ASSESSING:
+                self._stop_state = STOP_IDLE
+                self._stop_blocked_until = (
+                    time.monotonic() + self._stop_report_cooldown_sec
+                )
             return
         if not metrics:
             return
@@ -1090,15 +1101,18 @@ class TeleAlpaNode(Node):
                 f"  Q: {metrics['question']}\n"
                 f"  A: {metrics['answer'] or '(empty)'}"
             )
-        elif metrics["kind"] == "assist":
+        elif metrics["kind"] == "stop_report":
             traj_note = (
-                "" if metrics["has_trajectory"] else " (no trajectory — missing ego history)"
+                f"{metrics['num_points']} points"
+                if metrics["has_trajectory"]
+                else "no trajectory (missing ego history)"
             )
             self.get_logger().warning(
-                f"OPERATOR PING {metrics['proposal_id']} in "
-                f"{metrics['duration_sec']:.2f}s{traj_note}\n"
+                f"STOP REPORT {metrics['report_id']} in "
+                f"{metrics['duration_sec']:.2f}s ({traj_note}, "
+                f"{metrics['num_candidates']} pre-stop candidates)\n"
                 f"  scene: {metrics['description'] or '(empty)'}\n"
-                f"  approve: {metrics['approve_cmd']}"
+                f"  planner: {metrics['reasoning'] or '(none)'}"
             )
         else:
             self.get_logger().info(
@@ -1171,8 +1185,8 @@ class TeleAlpaNode(Node):
         markers.markers.append(line)
 
         if label:
-            # Floating caption above the end of the path, so an operator looking
-            # at RViz sees why the proposal exists without reading the topic.
+            # Floating caption above the end of the path, so RViz shows why the
+            # path was produced without reading the report topic.
             text = Marker()
             text.header.stamp = stamp
             text.header.frame_id = self._frame_id
