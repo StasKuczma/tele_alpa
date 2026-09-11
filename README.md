@@ -48,6 +48,66 @@ Camera × 4 (CompressedImage)   Odometry            Question (std_msgs/String)
         /alpamayo/nav_text)   +   /tele_alpa/answer (+ _stamped)
 ```
 
+## Operator assist — stop → describe → propose → approve
+
+When the ego's longitudinal velocity goes **non-positive** (`twist.twist.linear.x
+<= stopped_speed_threshold`, default 0.1 m/s) and stays there for
+`stopped_duration_sec` (default 5 s), the node runs one assist pass:
+
+1. **Describe** — VQA with `assist_question` → what is blocking the path.
+2. **Propose** — a nav-conditioned trajectory (`assist_nav_text`, default *"The
+   lane ahead is blocked. Plan a path around the obstacle."*) → a way around.
+3. **Ping** — a JSON message to the operator on `/tele_alpa/operator/ping`
+   (latched, so a tool that attaches late still sees it).
+4. **Approve** — the proposal is published on
+   `/tele_alpa/operator/proposed_trajectory` only. It reaches
+   `/tele_alpa/operator/approved_trajectory` **only after** the operator approves.
+
+The assist pass preempts the routine trajectory and VQA ticks (they share one GPU
+worker). It's all plain ROS topics — wiring `approved_trajectory` into Autoware's
+planning/control mux is deliberately left out.
+
+### Topics
+
+| Topic | Type | Direction |
+|---|---|---|
+| `/tele_alpa/operator/ping` | `std_msgs/String` (JSON, latched) | out — the operator request |
+| `/tele_alpa/operator/ping_stamped` | `StringStamped` | out |
+| `/tele_alpa/operator/status` | `std_msgs/String` (JSON, latched) | out — state machine |
+| `/tele_alpa/operator/proposed_trajectory` | `autoware_planning_msgs/Trajectory` (latched) | out — **suggestion only** |
+| `/tele_alpa/operator/proposed_trajectory_markers` | `MarkerArray` (latched) | out — orange path + caption for RViz |
+| `/tele_alpa/operator/approval` | `std_msgs/String` | **in** — `approve[:<id>]` / `reject[:<id>]` |
+| `/tele_alpa/operator/approved_trajectory` | `autoware_planning_msgs/Trajectory` | out — published on approval |
+
+State machine: `IDLE → STOPPED → ASSESSING → AWAITING_OPERATOR → APPROVED / REJECTED / EXPIRED`,
+returning to `IDLE` as soon as the ego moves again.
+
+### Using it
+
+```bash
+# watch for a request
+ros2 topic echo /tele_alpa/operator/ping
+ros2 topic echo /tele_alpa/operator/status
+
+# the ping's JSON carries a copy-paste approve/reject command, e.g.
+ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'approve:1a2b3c4d'}"
+ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'reject:1a2b3c4d'}"
+
+# bare 'approve' / 'reject' (no id) act on the outstanding proposal
+ros2 topic pub --once /tele_alpa/operator/approval std_msgs/String "{data: 'approve'}"
+
+# then
+ros2 topic echo /tele_alpa/operator/approved_trajectory
+```
+
+A proposal that gets no answer within `proposal_ttl_sec` (default 120 s) EXPIREs.
+After an approve / reject / expiry the node waits `assist_cooldown_sec`
+(default 30 s) before proposing again while the ego is still stopped.
+
+> The proposed path is **not** collision-checked, drivable-area-checked, or
+> feasibility-checked. Validate it before anything acts on it — operator approval
+> must not be the only safety gate.
+
 ### Other executables (optional)
 
 | Executable | Purpose |
@@ -146,6 +206,21 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 | `vqa_system_prompt` | `"You are a driving assistant. …answer the question about the scene directly…"` | System prompt for the VQA path; empty string keeps the upstream *"generates safe and accurate actions"* prompt |
 | `vqa_max_generation_length` | `384` | Token budget for the answer (too small → empty answer) |
 | `vqa_num_samples` | `1` | Answer samples per VQA run |
+
+Operator assist:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `operator_assist_enabled` | `true` | Run the stop → describe → propose → approve flow |
+| `stopped_speed_threshold` | `0.1` | m/s; `linear.x` at or below this counts as stopped |
+| `stopped_duration_sec` | `5.0` | Debounce, so ordinary traffic-light stops don't ping |
+| `assist_check_period_sec` | `0.5` | How often the stop condition / TTL is evaluated |
+| `proposal_ttl_sec` | `120.0` | Approval window before the proposal EXPIREs |
+| `assist_cooldown_sec` | `30.0` | Wait after approve/reject/expiry before re-proposing |
+| `assist_question` | *"…describe what is blocking the path ahead…"* | VQA prompt for the description |
+| `assist_nav_text` | *"The lane ahead is blocked. Plan a path around the obstacle."* | Route hint for the proposed path; empty → reuse the lanelet2 nav text |
+| `operator_ping_topic` / `operator_ping_stamped_topic` / `operator_status_topic` | `/tele_alpa/operator/…` | Outputs |
+| `proposed_trajectory_topic` / `approval_topic` / `approved_trajectory_topic` | `/tele_alpa/operator/…` | Proposal, operator input, approved output |
 
 Sampling (`use_greedy_decode` / `top_p` / `temperature`) is shared by both paths.
 

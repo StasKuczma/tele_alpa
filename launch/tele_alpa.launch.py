@@ -34,6 +34,12 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("lanelet2_map_path", default_value=""),
         DeclareLaunchArgument("require_new_data", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
+        # --- operator assist ---
+        DeclareLaunchArgument("operator_assist_enabled", default_value="true"),
+        DeclareLaunchArgument("stopped_speed_threshold", default_value="0.1"),
+        DeclareLaunchArgument("stopped_duration_sec", default_value="5.0"),
+        DeclareLaunchArgument("proposal_ttl_sec", default_value="120.0"),
+        DeclareLaunchArgument("assist_cooldown_sec", default_value="30.0"),
     ]
 
     node = Node(
@@ -69,6 +75,18 @@ def generate_launch_description() -> LaunchDescription:
                 "use_greedy_decode": True,
                 "require_new_data": LaunchConfiguration("require_new_data"),
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
+                # operator assist: ego stops -> describe + propose -> approve
+                "operator_assist_enabled": LaunchConfiguration("operator_assist_enabled"),
+                "stopped_speed_threshold": LaunchConfiguration("stopped_speed_threshold"),
+                "stopped_duration_sec": LaunchConfiguration("stopped_duration_sec"),
+                "proposal_ttl_sec": LaunchConfiguration("proposal_ttl_sec"),
+                "assist_cooldown_sec": LaunchConfiguration("assist_cooldown_sec"),
+                "operator_ping_topic": "/tele_alpa/operator/ping",
+                "operator_ping_stamped_topic": "/tele_alpa/operator/ping_stamped",
+                "operator_status_topic": "/tele_alpa/operator/status",
+                "proposed_trajectory_topic": "/tele_alpa/operator/proposed_trajectory",
+                "approval_topic": "/tele_alpa/operator/approval",
+                "approved_trajectory_topic": "/tele_alpa/operator/approved_trajectory",
             }
         ],
     )
