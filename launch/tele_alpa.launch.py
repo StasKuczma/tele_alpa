@@ -28,6 +28,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("vqa_enabled", default_value="true"),
         DeclareLaunchArgument("vqa_period_sec", default_value="2.0"),
         DeclareLaunchArgument("inference_period_sec", default_value="1.0"),
+        DeclareLaunchArgument(
+            "num_trajectory_candidates",
+            default_value="10",
+            description="Trajectories sampled per inference, published as CandidateTrajectories.",
+        ),
         DeclareLaunchArgument("require_new_data", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
     ]
@@ -43,6 +48,8 @@ def generate_launch_description() -> LaunchDescription:
                 "camera_indices": default_camera_indices,
                 "odometry_topic": "/localization/kinematic_state",
                 "trajectory_topic": "/alpamayo/predicted_trajectory",
+                "candidates_topic": "/alpamayo/trajectory_candidates",
+                "num_trajectory_candidates": LaunchConfiguration("num_trajectory_candidates"),
                 "cot_topic": "/alpamayo/reasoning",
                 "cot_with_stamped_topic": "/alpamayo/reasoning_stamped",
                 "question": LaunchConfiguration("question"),

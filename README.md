@@ -8,8 +8,11 @@ reuses the same `alpamayo1_5` inference library from this repo.
 The main node. It loads the Alpamayo 1.5 model **once** and runs, from the same
 buffered input:
 
-- **trajectory planning** — Autoware `Trajectory` + chain-of-thought + RViz
-  markers + navigation text (identical to `alpamayo_ros`), and
+- **trajectory planning** — `num_trajectory_candidates` (default 10) sampled
+  trajectories per inference, published together as
+  `autoware_internal_planning_msgs/CandidateTrajectories` so a later stage can
+  choose one; candidate 0 also goes out as the usual Autoware `Trajectory` +
+  chain-of-thought + RViz markers + navigation text (as in `alpamayo_ros`), and
 - **VQA** — answers to a free-form question about the live scene.
 
 The two inference paths share one worker thread, so they never run on the GPU at
@@ -39,8 +42,32 @@ Camera × 4 (CompressedImage)   Odometry            Question (std_msgs/String)
 │           (shared single-worker executor — never concurrent)  │    │
 └───────────────────────────────────────────────┬──────────────┘    │
         /alpamayo/predicted_trajectory (+ _markers, /alpamayo/reasoning,
-        /alpamayo/nav_text)   +   /tele_alpa/answer (+ _stamped)
+        /alpamayo/nav_text)   +   /alpamayo/trajectory_candidates
+        (+ /reasoning, /markers)   +   /tele_alpa/answer (+ _stamped)
 ```
+
+### Trajectory candidates
+
+Each trajectory inference asks the model for `num_trajectory_candidates`
+samples in one rollout (`num_traj_samples=N`, `num_traj_sets=1`). Each
+candidate gets its own chain-of-thought if the model returns one per sample.
+If it returns fewer, each CoT is shared by an equal block of candidates.
+
+| Topic | Type | Content |
+|-------|------|---------|
+| `/alpamayo/trajectory_candidates` | `autoware_internal_planning_msgs/CandidateTrajectories` | All N trajectories, `base_link` frame, one shared header stamp. Candidate *i* has a fixed `generator_id` (`generator_info[i].generator_name` = `alpamayo_candidate_<i>`), so "pick candidate 3" means the same slot in every message. |
+| `/alpamayo/trajectory_candidates/reasoning` | `autoware_internal_debug_msgs/StringStamped` | JSON `{stamp_sec, nav_text, candidates: [{index, generator_id, cot, meta_action}]}` — same stamp as the candidates, so the two join exactly. |
+| `/alpamayo/trajectory_candidates/markers` | `visualization_msgs/MarkerArray` | One coloured line per candidate with its index at the end; candidate 0 thicker. |
+| `/alpamayo/predicted_trajectory` | `autoware_planning_msgs/Trajectory` | Candidate 0 only — unchanged single-trajectory output (+ `_markers`, `/alpamayo/reasoning`). |
+
+The candidates are in sample order, not ranked; candidate 0 is just the
+default. Selection is left to the consumer. Cost: inference time and VRAM grow
+with N (N parallel VLM rollouts over the same image tokens). If you hit CUDA OOM
+or the period gets too long, lower it, e.g.
+`ros2 launch tele_alpa tele_alpa.launch.py num_trajectory_candidates:=4`.
+With `use_greedy_decode:=true` the N chains-of-thought may come out the same,
+so the candidates differ mainly through diffusion noise. Set it to `false` to
+get more varied reasoning.
 
 ### Other executables (optional)
 
@@ -130,6 +157,8 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 |-----------|---------|-------------|
 | `require_new_data` | `true` | Only infer when a new camera frame has arrived since the last run — stops trajectory/answer output on a frozen buffer after a bag ends |
 | `inference_period_sec` | `1.0` | Trajectory inference trigger period |
+| `num_trajectory_candidates` | `10` | Trajectories sampled per inference (see *Trajectory candidates*) |
+| `candidates_topic` | `/alpamayo/trajectory_candidates` | `CandidateTrajectories` output; `/reasoning` and `/markers` are derived from it |
 | `vqa_enabled` | `true` | Run the VQA path too |
 | `vqa_period_sec` | `2.0` | VQA trigger period |
 | `question` | `"What should the ego vehicle do next, and why?"` | Initial question |

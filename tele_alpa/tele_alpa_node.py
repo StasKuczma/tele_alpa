@@ -5,7 +5,9 @@
 """One ROS 2 node, one Alpamayo 1.5 model, two outputs:
 
 * an Autoware trajectory (+ chain-of-thought "reasoning" / RViz markers / nav
-  text), and
+  text) — sampled as ``num_trajectory_candidates`` alternatives per inference,
+  all published as ``CandidateTrajectories`` for a later stage to choose from,
+  and
 * answers to free-form questions about the live scene (VQA).
 
 The 10B model is loaded **once**. The trajectory path and the VQA path share a
@@ -34,8 +36,11 @@ different prompts and different decode routines:
 
 from __future__ import annotations
 
+import colorsys
+import json
 import math
 import time
+import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +50,11 @@ import numpy as np
 import rclpy
 import torch
 from autoware_internal_debug_msgs.msg import StringStamped
+from autoware_internal_planning_msgs.msg import (
+    CandidateTrajectories,
+    CandidateTrajectory,
+    GeneratorInfo,
+)
 from autoware_planning_msgs.msg import LaneletRoute, Trajectory, TrajectoryPoint
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Point
@@ -54,6 +64,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import ColorRGBA, String
+from unique_identifier_msgs.msg import UUID
 from visualization_msgs.msg import Marker, MarkerArray
 
 from alpamayo1_5 import helper
@@ -109,6 +120,11 @@ class TeleAlpaNode(Node):
         self.declare_parameter("temperature", 0.6)
         self.declare_parameter("max_generation_length", 64)
         self.declare_parameter("expert_onnx_path", "")
+        # Trajectories sampled per inference. All of them go out on
+        # `candidates_topic` for a later stage to choose from; candidate 0 is
+        # also published on `trajectory_topic` as the default pick.
+        self.declare_parameter("num_trajectory_candidates", 10)
+        self.declare_parameter("candidates_topic", "/alpamayo/trajectory_candidates")
 
         # --- shared ---
         # Only run inference when a new camera frame has arrived since the last
@@ -153,6 +169,15 @@ class TeleAlpaNode(Node):
             String, self.get_parameter("nav_text_topic").value, qs
         )
         self._marker_pub = self.create_publisher(MarkerArray, f"{traj_topic}_markers", qs)
+        cand_topic = self.get_parameter("candidates_topic").value
+        self._candidates_pub = self.create_publisher(CandidateTrajectories, cand_topic, qs)
+        # JSON per-candidate reasoning, stamped with the candidates' header stamp.
+        self._candidates_reasoning_pub = self.create_publisher(
+            StringStamped, f"{cand_topic}/reasoning", qs
+        )
+        self._candidates_marker_pub = self.create_publisher(
+            MarkerArray, f"{cand_topic}/markers", qs
+        )
         self._answer_pub = self.create_publisher(
             String, self.get_parameter("answer_topic").value, qs
         )
@@ -171,9 +196,21 @@ class TeleAlpaNode(Node):
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             ),
         )
+        self._num_candidates = max(1, int(self.get_parameter("num_trajectory_candidates").value))
+        # One stable generator per candidate slot, so a downstream selector can
+        # refer to "candidate i" across inferences.
+        self._generator_info = [
+            GeneratorInfo(
+                generator_id=UUID(
+                    uuid=list(uuid.uuid5(uuid.NAMESPACE_URL, f"tele_alpa/candidate/{i}").bytes)
+                ),
+                generator_name=String(data=f"alpamayo_candidate_{i}"),
+            )
+            for i in range(self._num_candidates)
+        ]
         self.get_logger().info(
-            f"Publishing trajectory on {traj_topic}, answers on "
-            f"{self.get_parameter('answer_topic').value}"
+            f"Publishing trajectory on {traj_topic}, {self._num_candidates} candidates on "
+            f"{cand_topic}, answers on {self.get_parameter('answer_topic').value}"
         )
 
         # --- executor + gating state (shared by both paths) ---
@@ -554,7 +591,7 @@ class TeleAlpaNode(Node):
         generation_kwargs = {
             "top_p": self._top_p,
             "temperature": self._temperature,
-            "num_traj_samples": 1,
+            "num_traj_samples": self._num_candidates,
             "num_traj_sets": 1,
             "max_generation_length": self._max_gen_len,
             "return_extra": True,
@@ -573,18 +610,60 @@ class TeleAlpaNode(Node):
                     )
                 )
 
-        trajectory = pred_xyz.detach().cpu()[0, 0, 0]
-        rotation = pred_rot.detach().cpu()[0, 0, 0]
-        traj_msg = self._to_autoware_trajectory(trajectory, rotation)
+        # [batch, traj_sets, traj_samples, T, ...] -> [N, T, ...] for batch 0.
+        xyz = pred_xyz.detach().float().cpu()[0]
+        rot = pred_rot.detach().float().cpu()[0]
+        xyz = xyz.reshape(-1, *xyz.shape[-2:])
+        rot = rot.reshape(-1, *rot.shape[-3:])
+        num = xyz.shape[0]
+        cots = self._extract_texts(extra, "cot", num)
+        meta_actions = self._extract_texts(extra, "meta_action", num)
+
+        stamp = self.get_clock().now().to_msg()
+        traj_msgs = [self._to_autoware_trajectory(xyz[i], rot[i], stamp) for i in range(num)]
+
+        # Candidate 0 stays on the single-trajectory topics as the default pick.
+        traj_msg = traj_msgs[0]
         self._trajectory_pub.publish(traj_msg)
-        self._marker_pub.publish(self._trajectory_to_markers(trajectory))
+        self._marker_pub.publish(self._trajectory_to_markers(xyz[0]))
+
+        candidates = CandidateTrajectories()
+        for i, t in enumerate(traj_msgs):
+            gen = self._generator_info[i % len(self._generator_info)]
+            candidates.candidate_trajectories.append(
+                CandidateTrajectory(header=t.header, generator_id=gen.generator_id, points=t.points)
+            )
+        candidates.generator_info = self._generator_info[: min(num, len(self._generator_info))]
+        self._candidates_pub.publish(candidates)
+        self._candidates_marker_pub.publish(self._candidates_to_markers(xyz, stamp))
+
+        reasoning = StringStamped()
+        reasoning.stamp = stamp
+        reasoning.data = json.dumps(
+            {
+                "stamp_sec": stamp.sec + stamp.nanosec * 1e-9,
+                "nav_text": nav_text,
+                "candidates": [
+                    {
+                        "index": i,
+                        "generator_id": bytes(
+                            self._generator_info[i % len(self._generator_info)].generator_id.uuid
+                        ).hex(),
+                        "cot": cots[i],
+                        "meta_action": meta_actions[i],
+                    }
+                    for i in range(num)
+                ],
+            }
+        )
+        self._candidates_reasoning_pub.publish(reasoning)
 
         if nav_text:
             m = String()
             m.data = nav_text
             self._nav_text_pub.publish(m)
 
-        cot_text = self._extract_text(extra, "cot")
+        cot_text = cots[0]
         if cot_text:
             m = String()
             m.data = cot_text
@@ -598,6 +677,7 @@ class TeleAlpaNode(Node):
             "kind": "trajectory",
             "duration_sec": time.time() - start,
             "num_poses": len(traj_msg.points),
+            "num_candidates": num,
         }
 
     # ------------------------------------------------------------------ #
@@ -748,13 +828,13 @@ class TeleAlpaNode(Node):
     # ------------------------------------------------------------------ #
 
     def _to_autoware_trajectory(
-        self, trajectory: torch.Tensor, rotations: torch.Tensor | None
+        self, trajectory: torch.Tensor, rotations: torch.Tensor | None, stamp=None
     ) -> Trajectory:
         traj_np = trajectory.numpy()
         rot_np = rotations.numpy() if rotations is not None else None
 
         traj_msg = Trajectory()
-        traj_msg.header.stamp = self.get_clock().now().to_msg()
+        traj_msg.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
         traj_msg.header.frame_id = self._frame_id
 
         dt = 0.1
@@ -811,17 +891,72 @@ class TeleAlpaNode(Node):
         marker_array.markers.append(line_marker)
         return marker_array
 
-    def _extract_text(self, extra: dict, key: str) -> Optional[str]:
+    def _candidates_to_markers(self, xyz: torch.Tensor, stamp) -> MarkerArray:
+        """One coloured line + index label per candidate; candidate 0 drawn thicker."""
+        marker_array = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = self._frame_id
+        clear.action = Marker.DELETEALL
+        marker_array.markers.append(clear)
+
+        num = xyz.shape[0]
+        for i, traj in enumerate(xyz.numpy()):
+            r, g, b = colorsys.hsv_to_rgb(i / num, 0.85, 1.0)
+            color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+
+            line = Marker()
+            line.header.stamp = stamp
+            line.header.frame_id = self._frame_id
+            line.ns = "candidates"
+            line.id = i
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.scale.x = 0.6 if i == 0 else 0.3
+            line.color = color
+            line.pose.orientation.w = 1.0
+            line.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in traj]
+            marker_array.markers.append(line)
+
+            label = Marker()
+            label.header = line.header
+            label.ns = "candidate_ids"
+            label.id = i
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.scale.z = 1.5
+            label.color = color
+            label.pose.position = Point(
+                x=float(traj[-1, 0]), y=float(traj[-1, 1]), z=float(traj[-1, 2]) + 1.0
+            )
+            label.pose.orientation.w = 1.0
+            label.text = str(i)
+            marker_array.markers.append(label)
+        return marker_array
+
+    @staticmethod
+    def _extract_texts(extra: dict, key: str, num: int) -> list[Optional[str]]:
+        """Per-candidate text spans from a planning rollout, aligned to ``num``.
+
+        Planning returns text as ``[batch, traj_sets, traj_samples]``; candidate
+        i reads entry i of batch 0. If there are fewer spans than trajectories
+        (one CoT shared by several diffusion samples), each span covers an equal
+        contiguous block of candidates.
+        """
         if not extra or key not in extra:
-            return None
+            return [None] * num
         try:
-            text = extra[key][0, 0, 0]
+            flat = np.asarray(extra[key], dtype=object)[0].reshape(-1)
         except Exception:
-            return None
-        if isinstance(text, bytes):
-            text = text.decode("utf-8", errors="ignore")
-        text = str(text).strip()
-        return text or None
+            return [None] * num
+        if flat.size == 0:
+            return [None] * num
+        texts: list[Optional[str]] = []
+        for i in range(num):
+            text = flat[min(i * flat.size // num, flat.size - 1)]
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="ignore")
+            texts.append(str(text).strip() or None)
+        return texts
 
     def _on_future_done(self, future: Future) -> None:
         try:
@@ -841,7 +976,8 @@ class TeleAlpaNode(Node):
         else:
             self.get_logger().info(
                 f"Trajectory inference completed in {metrics['duration_sec']:.2f}s "
-                f"(points={metrics.get('num_poses', 0)})."
+                f"(candidates={metrics.get('num_candidates', 0)}, "
+                f"points={metrics.get('num_poses', 0)})."
             )
 
     def destroy_node(self) -> None:
