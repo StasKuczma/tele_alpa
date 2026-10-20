@@ -6,8 +6,9 @@
 
 * an Autoware trajectory (+ chain-of-thought "reasoning" / RViz markers / nav
   text) — sampled as ``num_trajectory_candidates`` alternatives per inference,
-  all published as ``CandidateTrajectories`` for a later stage to choose from,
-  and
+  all published as ``CandidateTrajectories`` for a later stage to choose from.
+  By default the VLM reasons once and only the flow-matching action expert is
+  sampled N times (``num_reasoning_rollouts``, see ``shared_rollout.py``), and
 * answers to free-form questions about the live scene (VQA).
 
 The 10B model is loaded **once**. The trajectory path and the VQA path share a
@@ -69,6 +70,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
+from tele_alpa.shared_rollout import sample_trajectories_shared_rollout
 
 try:
     import lanelet2
@@ -124,6 +126,11 @@ class TeleAlpaNode(Node):
         # `candidates_topic` for a later stage to choose from; candidate 0 is
         # also published on `trajectory_topic` as the default pick.
         self.declare_parameter("num_trajectory_candidates", 10)
+        # VLM chain-of-causation rollouts per inference (R). The candidates are
+        # split evenly over them: each rollout's KV cache feeds N/R action-expert
+        # samples in one batch. 1 = reason once, cheapest; N = one rollout per
+        # candidate (upstream `num_traj_samples` behaviour), most diverse.
+        self.declare_parameter("num_reasoning_rollouts", 1)
         self.declare_parameter("candidates_topic", "/alpamayo/trajectory_candidates")
 
         # --- shared ---
@@ -197,6 +204,16 @@ class TeleAlpaNode(Node):
             ),
         )
         self._num_candidates = max(1, int(self.get_parameter("num_trajectory_candidates").value))
+        rollouts = int(self.get_parameter("num_reasoning_rollouts").value)
+        self._num_rollouts = min(max(1, rollouts), self._num_candidates)
+        self._samples_per_rollout = self._num_candidates // self._num_rollouts
+        if self._num_rollouts * self._samples_per_rollout != self._num_candidates:
+            self.get_logger().warn(
+                f"num_trajectory_candidates={self._num_candidates} is not a multiple of "
+                f"num_reasoning_rollouts={self._num_rollouts}; using "
+                f"{self._num_rollouts * self._samples_per_rollout} candidates"
+            )
+            self._num_candidates = self._num_rollouts * self._samples_per_rollout
         # One stable generator per candidate slot, so a downstream selector can
         # refer to "candidate i" across inferences.
         self._generator_info = [
@@ -209,8 +226,9 @@ class TeleAlpaNode(Node):
             for i in range(self._num_candidates)
         ]
         self.get_logger().info(
-            f"Publishing trajectory on {traj_topic}, {self._num_candidates} candidates on "
-            f"{cand_topic}, answers on {self.get_parameter('answer_topic').value}"
+            f"Publishing trajectory on {traj_topic}, {self._num_candidates} candidates "
+            f"({self._num_rollouts} VLM rollout(s) x {self._samples_per_rollout} diffusion "
+            f"samples) on {cand_topic}, answers on {self.get_parameter('answer_topic').value}"
         )
 
         # --- executor + gating state (shared by both paths) ---
@@ -591,26 +609,40 @@ class TeleAlpaNode(Node):
         generation_kwargs = {
             "top_p": self._top_p,
             "temperature": self._temperature,
-            "num_traj_samples": self._num_candidates,
-            "num_traj_sets": 1,
             "max_generation_length": self._max_gen_len,
             "return_extra": True,
         }
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            if nav_text:
+            if self._samples_per_rollout > 1:
+                # Reason R times, denoise R*K seeds against the repeated KV cache.
+                pred_xyz, pred_rot, extra = sample_trajectories_shared_rollout(
+                    self._model,
+                    model_inputs,
+                    num_rollouts=self._num_rollouts,
+                    samples_per_rollout=self._samples_per_rollout,
+                    nav_cfg=bool(nav_text),
+                    **generation_kwargs,
+                )
+            elif nav_text:
                 pred_xyz, pred_rot, extra = (
                     self._model.sample_trajectories_from_data_with_vlm_rollout_cfg_nav(
-                        data=model_inputs, **generation_kwargs
+                        data=model_inputs,
+                        num_traj_samples=self._num_candidates,
+                        num_traj_sets=1,
+                        **generation_kwargs,
                     )
                 )
             else:
                 pred_xyz, pred_rot, extra = (
                     self._model.sample_trajectories_from_data_with_vlm_rollout(
-                        data=model_inputs, **generation_kwargs
+                        data=model_inputs,
+                        num_traj_samples=self._num_candidates,
+                        num_traj_sets=1,
+                        **generation_kwargs,
                     )
                 )
 
-        # [batch, traj_sets, traj_samples, T, ...] -> [N, T, ...] for batch 0.
+        # [batch, rollouts|traj_sets, samples, T, ...] -> [N, T, ...] for batch 0.
         xyz = pred_xyz.detach().float().cpu()[0]
         rot = pred_rot.detach().float().cpu()[0]
         xyz = xyz.reshape(-1, *xyz.shape[-2:])
@@ -646,6 +678,8 @@ class TeleAlpaNode(Node):
                 "candidates": [
                     {
                         "index": i,
+                        # Candidates with the same rollout_index share one CoT.
+                        "rollout_index": i * self._num_rollouts // num,
                         "generator_id": bytes(
                             self._generator_info[i % len(self._generator_info)].generator_id.uuid
                         ).hex(),
@@ -678,6 +712,7 @@ class TeleAlpaNode(Node):
             "duration_sec": time.time() - start,
             "num_poses": len(traj_msg.points),
             "num_candidates": num,
+            "num_rollouts": self._num_rollouts,
         }
 
     # ------------------------------------------------------------------ #
@@ -977,6 +1012,7 @@ class TeleAlpaNode(Node):
             self.get_logger().info(
                 f"Trajectory inference completed in {metrics['duration_sec']:.2f}s "
                 f"(candidates={metrics.get('num_candidates', 0)}, "
+                f"rollouts={metrics.get('num_rollouts', 0)}, "
                 f"points={metrics.get('num_poses', 0)})."
             )
 

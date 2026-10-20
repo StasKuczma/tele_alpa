@@ -48,26 +48,38 @@ Camera × 4 (CompressedImage)   Odometry            Question (std_msgs/String)
 
 ### Trajectory candidates
 
-Each trajectory inference asks the model for `num_trajectory_candidates`
-samples in one rollout (`num_traj_samples=N`, `num_traj_sets=1`). Each
-candidate gets its own chain-of-thought if the model returns one per sample.
-If it returns fewer, each CoT is shared by an equal block of candidates.
+Each trajectory inference produces `num_trajectory_candidates` (N)
+trajectories from `num_reasoning_rollouts` (R, default 1) VLM rollouts.
+
+Most of Alpamayo's cost is the VLM: encoding the camera images and decoding the
+chain-of-causation text. The trajectory comes from the much lighter
+flow-matching action expert. Upstream `num_traj_samples=N` sets
+`num_return_sequences=N`, so `generate` copies the prompt and images N times and
+reasons N times. `tele_alpa/shared_rollout.py` runs the VLM R times instead.
+It repeats each rollout's KV cache N/R times, and the action expert then
+denoises N noise seeds in one batch. With R=1 that is one VLM call plus one
+batched denoise. The installed `alpamayo1_5` package is not modified.
+
+Candidates are laid out rollout by rollout. Candidates that share a
+`rollout_index` (in the `/reasoning` JSON) share one CoT and differ only by
+diffusion noise, so expect less spread than with independent rollouts. To get
+more varied manoeuvres, raise R, e.g. `num_reasoning_rollouts:=2` for 2 CoTs x 5
+samples. `num_reasoning_rollouts:=N` gives back the upstream path, with one CoT
+per candidate. `num_diffusion_steps` (Euler steps, default 5) can be lowered
+further, e.g. to 3. Quality degrades gracefully.
 
 | Topic | Type | Content |
 |-------|------|---------|
 | `/alpamayo/trajectory_candidates` | `autoware_internal_planning_msgs/CandidateTrajectories` | All N trajectories, `base_link` frame, one shared header stamp. Candidate *i* has a fixed `generator_id` (`generator_info[i].generator_name` = `alpamayo_candidate_<i>`), so "pick candidate 3" means the same slot in every message. |
-| `/alpamayo/trajectory_candidates/reasoning` | `autoware_internal_debug_msgs/StringStamped` | JSON `{stamp_sec, nav_text, candidates: [{index, generator_id, cot, meta_action}]}` — same stamp as the candidates, so the two join exactly. |
+| `/alpamayo/trajectory_candidates/reasoning` | `autoware_internal_debug_msgs/StringStamped` | JSON `{stamp_sec, nav_text, candidates: [{index, rollout_index, generator_id, cot, meta_action}]}` — same stamp as the candidates, so the two join exactly. |
 | `/alpamayo/trajectory_candidates/markers` | `visualization_msgs/MarkerArray` | One coloured line per candidate with its index at the end; candidate 0 thicker. |
 | `/alpamayo/predicted_trajectory` | `autoware_planning_msgs/Trajectory` | Candidate 0 only — unchanged single-trajectory output (+ `_markers`, `/alpamayo/reasoning`). |
 
 The candidates are in sample order, not ranked; candidate 0 is just the
-default. Selection is left to the consumer. Cost: inference time and VRAM grow
-with N (N parallel VLM rollouts over the same image tokens). If you hit CUDA OOM
-or the period gets too long, lower it, e.g.
+default. Selection is left to the consumer. Cost: the VLM part grows with R.
+The KV-cache copies, and so VRAM, still grow with N, because the expert attends
+to one copy per sample. If you hit CUDA OOM, lower N, e.g.
 `ros2 launch tele_alpa tele_alpa.launch.py num_trajectory_candidates:=4`.
-With `use_greedy_decode:=true` the N chains-of-thought may come out the same,
-so the candidates differ mainly through diffusion noise. Set it to `false` to
-get more varied reasoning.
 
 ### Other executables (optional)
 
@@ -158,6 +170,7 @@ All `alpamayo_ros` trajectory parameters (`camera_topics`, `camera_indices`,
 | `require_new_data` | `true` | Only infer when a new camera frame has arrived since the last run — stops trajectory/answer output on a frozen buffer after a bag ends |
 | `inference_period_sec` | `1.0` | Trajectory inference trigger period |
 | `num_trajectory_candidates` | `10` | Trajectories sampled per inference (see *Trajectory candidates*) |
+| `num_reasoning_rollouts` | `1` | VLM reasoning rollouts per inference; candidates split evenly over them (see *Trajectory candidates*) |
 | `candidates_topic` | `/alpamayo/trajectory_candidates` | `CandidateTrajectories` output; `/reasoning` and `/markers` are derived from it |
 | `vqa_enabled` | `true` | Run the VQA path too |
 | `vqa_period_sec` | `2.0` | VQA trigger period |

@@ -33,6 +33,13 @@ def generate_launch_description() -> LaunchDescription:
             default_value="10",
             description="Trajectories sampled per inference, published as CandidateTrajectories.",
         ),
+        DeclareLaunchArgument(
+            "num_reasoning_rollouts",
+            default_value="1",
+            description="VLM reasoning rollouts per inference; candidates are split evenly "
+            "over them (1 = reason once, sample only the action expert N times).",
+        ),
+        DeclareLaunchArgument("num_diffusion_steps", default_value="5"),
         DeclareLaunchArgument("require_new_data", default_value="true"),
         DeclareLaunchArgument("use_sim_time", default_value="false"),
     ]
@@ -50,6 +57,8 @@ def generate_launch_description() -> LaunchDescription:
                 "trajectory_topic": "/alpamayo/predicted_trajectory",
                 "candidates_topic": "/alpamayo/trajectory_candidates",
                 "num_trajectory_candidates": LaunchConfiguration("num_trajectory_candidates"),
+                "num_reasoning_rollouts": LaunchConfiguration("num_reasoning_rollouts"),
+                "num_diffusion_steps": LaunchConfiguration("num_diffusion_steps"),
                 "cot_topic": "/alpamayo/reasoning",
                 "cot_with_stamped_topic": "/alpamayo/reasoning_stamped",
                 "question": LaunchConfiguration("question"),
